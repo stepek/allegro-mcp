@@ -1,0 +1,51 @@
+[package]
+name        = "allegro-mcp"
+version     = "0.1.0"
+edition     = "2021"
+rust-version = "1.88"
+description = "MCP server for Allegro REST API — tools generated at runtime from the official OpenAPI 3.0 schema"
+license     = "MIT"
+repository  = "https://github.com/stepek/allegro-mcp"
+readme      = "README.md"
+
+[[bin]]
+name = "allegro-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# MCP SDK — official Rust implementation
+rmcp            = { version = "3.2.0", features = ["server", "transport-io"] }
+
+# OpenAPI schema parsing
+openapiv3       = "2.2.0"
+
+# HTTP client (rustls — no OpenSSL dependency)
+reqwest         = { version = "0.12.15", default-features = false, features = ["rustls-tls", "json"] }
+
+# Async runtime
+tokio           = { version = "1.45.1", features = ["full"] }
+
+# Serialisation
+serde           = { version = "1.0.219", features = ["derive"] }
+serde_json      = "1.0.140"
+serde_yaml      = "0.9.34"
+
+# Error handling
+thiserror       = "2.0.12"
+anyhow          = "1.0.98"
+
+# CLI
+clap            = { version = "4.5.38", features = ["derive"] }
+
+# Logging / tracing
+tracing             = "0.1.41"
+tracing-subscriber  = { version = "0.3.19", features = ["env-filter", "fmt"] }
+
+# Platform directories (config/cache paths)
+dirs            = "6.0.0"
+
+[profile.release]
+strip    = true
+opt-level = 3
+lto      = true
+codegen-units = 1
