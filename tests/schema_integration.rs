@@ -42,9 +42,10 @@ async fn not_oas3_returns_error() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn cache_write_and_read_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    // SAFETY: current_thread flavor ensures single-threaded execution; set_var is safe here
+    // SAFETY: current_thread + serial ensures single-threaded, no concurrent env access
     unsafe {
         std::env::set_var("ALLEGRO_MCP_CACHE_DIR", dir.path());
     }

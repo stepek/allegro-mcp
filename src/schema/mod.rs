@@ -56,7 +56,12 @@ pub async fn load(source: &SchemaSource) -> Result<(OpenAPI, Vec<u8>), SchemaErr
         SchemaSource::File(path) => std::fs::read(path)?,
         SchemaSource::Url(url) => match fetch::fetch_bytes(url).await {
             Ok(b) => {
-                let _ = cache::write_cache(&b);
+                if cache::detect_drift(&b) {
+                    tracing::warn!("upstream schema has drifted from cached version");
+                }
+                if let Err(e) = cache::write_cache(&b) {
+                    tracing::warn!("cache write failed: {}", e);
+                }
                 b
             }
             Err(e) => {

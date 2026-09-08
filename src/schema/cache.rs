@@ -41,8 +41,6 @@ pub fn read_cache() -> Result<Vec<u8>, SchemaError> {
 }
 
 /// Read the stored sha256 of the last good schema (empty string if absent).
-// Not yet wired into the bin's CLI output; part of the public cache API.
-#[allow(dead_code)]
 pub fn read_cached_sha256() -> String {
     sha256_path()
         .ok()
@@ -52,8 +50,6 @@ pub fn read_cached_sha256() -> String {
 
 /// Compute sha256 of bytes and compare to cached value.
 /// Returns `true` if the schema has changed since last cache write.
-// Not yet wired into the bin's CLI output; part of the public cache API.
-#[allow(dead_code)]
 pub fn detect_drift(bytes: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
     let current = format!("{:x}", Sha256::digest(bytes));

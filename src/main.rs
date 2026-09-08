@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
             println!("SHA-256:    {}", stats.sha256);
         }
         None => {
-            info!("No subcommand — MCP server mode (not yet implemented)");
+            tracing::warn!("No subcommand — MCP server mode not yet implemented");
         }
     }
 
