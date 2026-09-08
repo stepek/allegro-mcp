@@ -8,7 +8,7 @@
 
 **Root cause / scope**: Nothing exists yet — this is greenfield scaffolding. Every file listed below must be created from scratch.
 
-**Key dependency research**: The official Rust MCP SDK crate is `rmcp` (published by `modelcontextprotocol`), currently at **v3.1.4** on crates.io. It requires Rust ≥ 1.88 (edition 2024). The `server` feature (default) pulls in `schemars`, `uuid`, and `transport-async-rw`. For stdio transport the `transport-io` feature is needed.
+**Key dependency research**: The official Rust MCP SDK crate is `rmcp` (published by `modelcontextprotocol`), currently at **v3.2.0** on crates.io. The `rmcp` crate itself is written in edition 2024 and requires Rust ≥ 1.88 — this is an internal detail of the SDK, **not** a requirement on consumers. Our binary crate uses **edition 2021**, which is correct and intentional. The `server` feature (default) pulls in `schemars`, `uuid`, and `transport-async-rw`. For stdio transport the `transport-io` feature is needed.
 
 ---
 
@@ -55,10 +55,10 @@ path = "src/main.rs"
 
 [dependencies]
 # MCP SDK — official Rust implementation
-rmcp            = { version = "3.1.4", features = ["server", "transport-io"] }
+rmcp            = { version = "3.2.0", features = ["server", "transport-io"] }
 
 # OpenAPI schema parsing
-openapiv3       = "2.0.0"
+openapiv3       = "2.2.0"
 
 # HTTP client (rustls — no OpenSSL dependency)
 reqwest         = { version = "0.12.15", default-features = false, features = ["rustls-tls", "json"] }
@@ -94,9 +94,11 @@ codegen-units = 1
 
 > **Version pinning rationale**: All versions above are the latest stable at the time of writing (2026-09-08). They are pinned at the minor level (e.g. `"1.45.1"`) so `Cargo.lock` is the true pin and `Cargo.toml` communicates intent. `Cargo.lock` must be committed for a binary crate.
 
-> **`openapiv3` version note**: The crate is at `2.0.0` on crates.io. Verify with `cargo search openapiv3` before committing — if a newer patch exists, use it.
+> **`openapiv3` version note**: The crate is at `2.2.0` on crates.io. Verify with `cargo search openapiv3` before committing — if a newer patch exists, use it.
 
-> **`reqwest` version note**: `rmcp` itself depends on `reqwest 0.13.x` internally (for its optional HTTP transport features). Because `allegro-mcp` uses `rmcp` only with `transport-io` (stdio), there is no version conflict — our `reqwest 0.12.x` is a separate direct dependency for outbound Allegro API calls. If Cargo reports a conflict, pin to `0.13.x` to match rmcp's transitive dep.
+> **`reqwest` version note**: Both `rmcp` and our direct dep use `reqwest 0.12.x`. Cargo unifies them automatically — no conflict. The real risk is accidentally enabling rmcp's optional `reqwest` feature (e.g. `transport-streamable-http-client-reqwest`), which would pull in rmcp's own reqwest configuration. Avoid enabling any rmcp HTTP transport features; stick to `server` and `transport-io` only.
+
+> **Edition note**: `rmcp` is internally written in edition 2024 and requires Rust ≥ 1.88. This is an implementation detail of the SDK crate itself. Our consumer binary uses edition 2021, which is fully compatible — Rust editions are per-crate and do not propagate to dependents.
 
 ---
 
@@ -196,7 +198,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy -D warnings
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo build
         run: cargo build --locked
@@ -210,6 +212,7 @@ jobs:
 > - `dtolnay/rust-toolchain@stable` is the canonical action; it respects `rust-toolchain.toml` if present.
 > - `Swatinem/rust-cache@v2` caches `~/.cargo/registry` and `target/` keyed on `Cargo.lock`, dramatically speeding up subsequent runs.
 > - `fail-fast: false` lets all three OS jobs run even if one fails, giving full signal.
+> - Clippy uses `--all-targets` (not `--all-features`) to avoid activating optional heavy dependencies (e.g. rmcp HTTP transports, native-tls backends) that may fail to compile on some platforms during bootstrap.
 
 ---
 
@@ -275,7 +278,7 @@ cargo test
 cargo fmt --all -- --check
 
 # Run lints (must be warning-free)
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 ## Branching convention
@@ -336,7 +339,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CHANGELOG.md` (this file).
 - Minimal `src/main.rs` with `clap` CLI skeleton and `tracing` initialisation.
 
-[Unreleased]: https://github.com/stepek/allegro-mcp/compare/HEAD...HEAD
+[Unreleased]: https://github.com/stepek/allegro-mcp/compare/v0.1.0...HEAD
 ```
 
 ---
@@ -347,6 +350,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **Agent**: `implementer`  
 **Branch**: `feat/gh-1-bootstrap`
+
+> **Note on CI ordering**: The CI workflow (Phase 2) is created *after* the scaffold files (Phase 1). This means the very first push of Phase 1 files will have no CI running — that is acceptable for bootstrap. CI will be active from the Phase 2 push onward, and will run retroactively on any subsequent push to the branch.
 
 Steps (in order):
 
@@ -372,7 +377,7 @@ Steps:
 2. Push the branch to GitHub.
 3. Verify the Actions tab shows three jobs (ubuntu, macos, windows) all green.
 
-**Checkpoint**: All three CI jobs pass on the first push.
+**Checkpoint**: All three CI jobs pass on the first push that includes `ci.yml`.
 
 ---
 
@@ -385,8 +390,9 @@ Steps:
 1. Create `CONTRIBUTING.md` with the content above.
 2. Create `CHANGELOG.md` with the content above.
 3. Commit with message: `chore: add CONTRIBUTING.md and CHANGELOG.md`.
+4. Set repository topics on GitHub via **Settings → Topics**: add `rust`, `mcp`, `allegro`, `openapi`. This satisfies the ticket requirement for topic labels on the repository.
 
-**Checkpoint**: Files exist on the branch and render correctly on GitHub.
+**Checkpoint**: Files exist on the branch and render correctly on GitHub. Repository topics are visible on the repo homepage.
 
 ---
 
@@ -418,22 +424,23 @@ Steps:
 | `CONTRIBUTING.md` exists | File present on `master` after merge |
 | `CHANGELOG.md` exists | File present on `master` after merge, keepachangelog format |
 | `Cargo.lock` committed | `git ls-files Cargo.lock` returns the file |
+| Repository topics set | `rust`, `mcp`, `allegro`, `openapi` visible on GitHub repo homepage |
 
 ---
 
 ## Edge Cases and Risks
 
-### 1. `reqwest` version conflict with `rmcp`
+### 1. `reqwest` version unification with `rmcp`
 
-**Risk**: `rmcp 3.1.4` has an optional dep on `reqwest 0.13.x`. If the implementer enables any rmcp HTTP feature, Cargo will try to unify `reqwest 0.12.x` (our direct dep) and `0.13.x`, which are semver-incompatible and will fail.
+**Risk**: Both `rmcp 3.2.0` and our direct dep use `reqwest 0.12.x`. Cargo unifies them automatically — this is not a conflict. However, if the implementer accidentally enables any of rmcp's optional HTTP transport features (e.g. `transport-streamable-http-client-reqwest`, `reqwest`), rmcp will activate its own reqwest feature flags, which may conflict with our `rustls-tls` configuration or pull in unexpected TLS backends.
 
-**Mitigation**: We only enable `rmcp` features `server` and `transport-io` (stdio). Neither pulls in reqwest. Our direct `reqwest 0.12.x` dep is independent. If a conflict appears anyway, bump our dep to `0.13.x`.
+**Mitigation**: Only enable `rmcp` features `server` and `transport-io`. Never enable rmcp's `reqwest` or any `transport-streamable-http-*` feature in this crate. Verify with `cargo tree -f "{p} {f}" | grep reqwest` that only one reqwest instance appears in the dependency tree.
 
 ### 2. `openapiv3` version
 
-**Risk**: The crate may have moved past `2.0.0` by the time this is implemented, or the `2.0.0` API may have breaking changes from `1.x`.
+**Risk**: The crate is at `2.2.0`. It is only a placeholder dep in phase 1 (not used in `main.rs`), so compilation is the only concern. If a newer patch exists, it is safe to use.
 
-**Mitigation**: Run `cargo search openapiv3` and use the latest `2.x` patch. The crate is only a placeholder dep in phase 1 (not used in `main.rs`), so compilation is the only concern.
+**Mitigation**: Run `cargo search openapiv3` and use the latest `2.x` patch before committing.
 
 ### 3. `serde_yaml` deprecation / YAML parsing
 
