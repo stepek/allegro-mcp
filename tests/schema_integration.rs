@@ -1,5 +1,7 @@
 use allegro_mcp::schema::{self, SchemaError, SchemaSource};
 use std::path::PathBuf;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,17 +30,17 @@ async fn compute_stats_counts_correctly() {
 
 #[tokio::test]
 async fn not_oas3_returns_error() {
-    // Write a fake OAS 2.x doc to a temp file
+    // A doc with openapi: "2.0" triggers NotOas3 (the openapi field is present but non-3.x)
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swagger2.yaml");
+    let path = dir.path().join("oas2.yaml");
     std::fs::write(
         &path,
-        b"swagger: \"2.0\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
+        b"openapi: \"2.0\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
     )
     .unwrap();
     let source = SchemaSource::File(path);
     let result = schema::load(&source).await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(SchemaError::NotOas3 { .. })));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -53,6 +55,10 @@ async fn cache_write_and_read_roundtrip() {
     schema::cache::write_cache(&bytes).expect("write_cache failed");
     let read_back = schema::cache::read_cache().expect("read_cache failed");
     assert_eq!(bytes, read_back);
+    let sha256_path = dir.path().join("swagger.yaml.sha256");
+    assert!(sha256_path.exists(), "sha256 sidecar file should exist");
+    let sha256_content = std::fs::read_to_string(&sha256_path).unwrap();
+    assert_eq!(sha256_content.len(), 64, "sha256 should be 64 hex chars");
     unsafe {
         std::env::remove_var("ALLEGRO_MCP_CACHE_DIR");
     }
@@ -78,14 +84,13 @@ fn schema_source_default_is_allegro_url() {
 
 #[tokio::test]
 async fn load_non_existent_file_returns_io_error() {
-    let source = SchemaSource::File(PathBuf::from("/tmp/allegro_mcp_does_not_exist_xyz.yaml"));
-    let err = schema::load(&source)
-        .await
-        .expect_err("loading a missing file should fail");
-    assert!(
-        matches!(err, SchemaError::Io(_)),
-        "expected SchemaError::Io for missing file, got: {err:?}"
-    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("does_not_exist.yaml");
+    // Verify the path doesn't exist
+    assert!(!path.exists());
+    let source = SchemaSource::File(path);
+    let result = schema::load(&source).await;
+    assert!(matches!(result, Err(SchemaError::Io(_))));
 }
 
 // ── compute_stats edge cases ─────────────────────────────────────────────────
@@ -105,7 +110,10 @@ async fn compute_stats_zero_paths() {
     let (api, raw) = schema::load(&source).await.expect("load failed");
     let stats = schema::compute_stats(&api, &raw);
 
-    assert_eq!(stats.path_count, 0, "path_count should be 0 for empty paths");
+    assert_eq!(
+        stats.path_count, 0,
+        "path_count should be 0 for empty paths"
+    );
     assert_eq!(
         stats.operation_count, 0,
         "operation_count should be 0 for empty paths"
@@ -114,7 +122,11 @@ async fn compute_stats_zero_paths() {
         stats.parameter_count, 0,
         "parameter_count should be 0 for empty paths"
     );
-    assert_eq!(stats.sha256.len(), 64, "sha256 should always be 64 hex chars");
+    assert_eq!(
+        stats.sha256.len(),
+        64,
+        "sha256 should always be 64 hex chars"
+    );
 }
 
 #[tokio::test]
@@ -200,4 +212,91 @@ async fn load_non_3x_openapi_field_returns_not_oas3_error() {
         matches!(err, SchemaError::NotOas3 { .. }),
         "expected SchemaError::NotOas3, got: {err:?}"
     );
+}
+
+// ── load() URL path ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[serial_test::serial]
+async fn load_url_success_writes_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_bytes = std::fs::read(fixture_path()).unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fixture_bytes.clone()))
+        .mount(&server)
+        .await;
+    // SAFETY: serial ensures single-threaded env access
+    unsafe {
+        std::env::set_var("ALLEGRO_MCP_CACHE_DIR", dir.path());
+    }
+    let source = SchemaSource::Url(server.uri());
+    let result = schema::load(&source).await;
+    unsafe {
+        std::env::remove_var("ALLEGRO_MCP_CACHE_DIR");
+    }
+    assert!(result.is_ok());
+    // Cache file should have been written
+    assert!(dir.path().join("swagger.yaml").exists());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn load_url_fetch_fails_falls_back_to_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_bytes = std::fs::read(fixture_path()).unwrap();
+    // Pre-populate cache
+    // SAFETY: serial ensures single-threaded env access
+    unsafe {
+        std::env::set_var("ALLEGRO_MCP_CACHE_DIR", dir.path());
+    }
+    schema::cache::write_cache(&fixture_bytes).unwrap();
+    // Use a URL that will fail (invalid host — nothing listening on port 1)
+    let source = SchemaSource::Url("http://127.0.0.1:1".to_string());
+    let result = schema::load(&source).await;
+    unsafe {
+        std::env::remove_var("ALLEGRO_MCP_CACHE_DIR");
+    }
+    assert!(result.is_ok(), "should fall back to cache on fetch failure");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn load_url_fetch_fails_no_cache_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    // SAFETY: serial ensures single-threaded env access
+    unsafe {
+        std::env::set_var("ALLEGRO_MCP_CACHE_DIR", dir.path());
+    }
+    // Use a URL that will fail (invalid host), no cache pre-populated
+    let source = SchemaSource::Url("http://127.0.0.1:1".to_string());
+    let result = schema::load(&source).await;
+    unsafe {
+        std::env::remove_var("ALLEGRO_MCP_CACHE_DIR");
+    }
+    assert!(
+        result.is_err(),
+        "should return error when fetch fails and no cache"
+    );
+}
+
+// ── compute_stats $ref path items ────────────────────────────────────────────
+
+#[tokio::test]
+async fn compute_stats_skips_reference_path_items() {
+    // Path items that are $refs are skipped in compute_stats (counted as paths but not operations)
+    // This is intentional — we only count inline operations
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ref_paths.yaml");
+    std::fs::write(
+        &path,
+        b"openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths:\n  /ref-path:\n    $ref: \"#/components/pathItems/myPath\"\ncomponents: {}\n",
+    )
+    .unwrap();
+    let source = SchemaSource::File(path);
+    let (api, raw) = schema::load(&source).await.expect("load failed");
+    let stats = schema::compute_stats(&api, &raw);
+    // The path is counted but the $ref operation is not resolved/counted
+    assert_eq!(stats.path_count, 1);
+    assert_eq!(stats.operation_count, 0); // $ref path items are skipped
 }

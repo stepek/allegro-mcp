@@ -35,3 +35,48 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, SchemaError> {
     }
     Err(SchemaError::Fetch(last_err.unwrap()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn fetch_bytes_success_returns_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world"))
+            .mount(&server)
+            .await;
+        let result = fetch_bytes(&server.uri()).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_404_returns_fetch_error_immediately() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let result = fetch_bytes(&server.uri()).await;
+        assert!(matches!(result, Err(SchemaError::Fetch(_))));
+        // 404 should NOT retry — verify only 1 request was made
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_500_returns_fetch_error_immediately() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let result = fetch_bytes(&server.uri()).await;
+        assert!(matches!(result, Err(SchemaError::Fetch(_))));
+        // 500 should NOT retry — verify only 1 request was made
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
