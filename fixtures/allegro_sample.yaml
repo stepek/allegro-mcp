@@ -1,0 +1,105 @@
+openapi: "3.0.3"
+info:
+  title: Allegro Sample API
+  version: "1.0.0"
+paths:
+  /sale/offers:
+    get:
+      operationId: getListingOffers
+      summary: List offers
+      x-allegro-scope: sale
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+    post:
+      operationId: createOffer
+      summary: Create an offer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OfferRequest"
+      responses:
+        "201":
+          description: Created
+  /sale/offers/{offerId}:
+    get:
+      operationId: getOffer
+      summary: Get offer by ID
+      parameters:
+        - name: offerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+    put:
+      operationId: updateOffer
+      summary: Update an offer
+      parameters:
+        - name: offerId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OfferRequest"
+      responses:
+        "200":
+          description: OK
+    delete:
+      operationId: deleteOffer
+      summary: Delete an offer
+      parameters:
+        - name: offerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: No Content
+components:
+  schemas:
+    OfferRequest:
+      type: object
+      required:
+        - name
+        - price
+      properties:
+        name:
+          type: string
+        price:
+          $ref: "#/components/schemas/Price"
+        category:
+          $ref: "#/components/schemas/Category"
+    Price:
+      type: object
+      properties:
+        amount:
+          type: string
+        currency:
+          type: string
+    Category:
+      type: object
+      properties:
+        id:
+          type: string
+        parent:
+          $ref: "#/components/schemas/Category" # self-referential cycle
