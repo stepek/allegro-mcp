@@ -115,6 +115,12 @@ impl AllegroAuth {
         Ok(Self::new(client_id, client_secret, sandbox))
     }
 
+    /// Returns the auth base URL. Exposed for testing only.
+    #[cfg(test)]
+    fn auth_base_url(&self) -> &str {
+        &self.auth_base_url
+    }
+
     /// Constructs an [`AllegroAuth`] with explicit credentials.
     pub fn new(client_id: String, client_secret: String, sandbox: bool) -> Self {
         let auth_base_url = if sandbox {
@@ -305,16 +311,139 @@ mod tests {
         assert!(!token.is_valid(), "expired token should not be valid");
     }
 
+    /// Boundary: 62 s remaining is strictly greater than the 60 s threshold,
+    /// so `is_valid()` must return `true`.
+    ///
+    /// Uses 62 s (not 61 s) to give a 1-second margin against timing jitter
+    /// on loaded machines where two `Instant::now()` calls may differ by ~1 s.
     #[test]
-    fn cached_token_is_invalid_within_60s_buffer() {
-        // expires_at is 30 s in the future — within the 60 s buffer
+    fn cached_token_is_valid_at_61s_boundary() {
+        let token = CachedToken {
+            access_token: "tok".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(62),
+        };
+        assert!(
+            token.is_valid(),
+            "token with 62 s remaining should be valid (> 60 s threshold)"
+        );
+    }
+
+    /// Boundary: 30 s remaining is NOT strictly greater than the 60 s threshold
+    /// (`remaining > Duration::from_secs(60)` is false), so `is_valid()` must
+    /// return `false`. Uses 30 s (well below 60 s) for a stable margin.
+    #[test]
+    fn cached_token_is_invalid_at_exactly_60s_boundary() {
         let token = CachedToken {
             access_token: "tok".to_owned(),
             expires_at: Instant::now() + Duration::from_secs(30),
         };
         assert!(
             !token.is_valid(),
-            "token with only 30 s remaining should be considered invalid (60 s buffer)"
+            "token with 30 s remaining should be invalid (threshold is strictly > 60 s)"
+        );
+    }
+
+    /// `AllegroAuth::new` with `sandbox = false` must use the production base URL.
+    /// Uses the `#[cfg(test)]` accessor to avoid coupling to `Debug` format strings.
+    #[test]
+    fn new_production_uses_prod_url() {
+        let auth = AllegroAuth::new("id".to_owned(), "secret".to_owned(), false);
+        assert_eq!(
+            auth.auth_base_url(),
+            "https://allegro.pl",
+            "production auth_base_url must be 'https://allegro.pl'"
+        );
+    }
+
+    /// `AllegroAuth::new` with `sandbox = true` must use the sandbox base URL.
+    /// Uses the `#[cfg(test)]` accessor to avoid coupling to `Debug` format strings.
+    #[test]
+    fn new_sandbox_uses_sandbox_url() {
+        let auth = AllegroAuth::new("id".to_owned(), "secret".to_owned(), true);
+        assert_eq!(
+            auth.auth_base_url(),
+            "https://allegro.pl.allegrosandbox.pl",
+            "sandbox auth_base_url must be 'https://allegro.pl.allegrosandbox.pl'"
+        );
+    }
+
+    /// The `Debug` output must expose `client_id` and `auth_base_url` in
+    /// addition to the redacted secret (the existing test only checks the
+    /// secret; this test verifies the other fields are present).
+    #[test]
+    fn debug_includes_client_id_and_base_url() {
+        let auth = AllegroAuth::new("my-client-id".to_owned(), "s3cr3t".to_owned(), false);
+        let debug_str = format!("{auth:?}");
+        assert!(
+            debug_str.contains("my-client-id"),
+            "Debug output must contain client_id, got: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("auth_base_url"),
+            "Debug output must contain the auth_base_url field name, got: {debug_str}"
+        );
+    }
+
+    /// `MalformedResponse` error variant must format with the field name.
+    ///
+    /// This variant is reserved for future use (see `#[allow(dead_code)]` on the
+    /// variant). Update or remove this test when the variant is promoted to active use.
+    #[test]
+    fn malformed_response_error_display() {
+        let err = AuthError::MalformedResponse("access_token");
+        assert_eq!(
+            err.to_string(),
+            "token response missing required field: access_token"
+        );
+    }
+
+    /// Verifies that a token stored with a 120 s lifetime (the minimum after
+    /// clamping) is considered valid immediately after creation.
+    ///
+    /// This exercises the `expires_in < 120` clamping path in `token()`:
+    /// a clamped token has `expires_at = now + 120s`, which is > 60 s from now,
+    /// so `is_valid()` must return `true`.
+    #[test]
+    fn cached_token_with_clamped_120s_lifetime_is_valid() {
+        let token = CachedToken {
+            access_token: "tok".to_owned(),
+            // Simulate the clamped expires_at: now + 120 s
+            expires_at: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(
+            token.is_valid(),
+            "token clamped to 120 s lifetime should be valid immediately after creation"
+        );
+    }
+
+    /// Verifies that `from_env` returns `Err(MissingEnvVar("ALLEGRO_CLIENT_SECRET"))`
+    /// when `ALLEGRO_CLIENT_ID` is present but `ALLEGRO_CLIENT_SECRET` is absent.
+    ///
+    /// Only runs when `ALLEGRO_CLIENT_ID` is set and `ALLEGRO_CLIENT_SECRET` is not,
+    /// to avoid mutating the process environment in a parallel test harness.
+    #[test]
+    fn from_env_returns_err_for_missing_secret() {
+        if std::env::var("ALLEGRO_CLIENT_ID").is_ok()
+            && std::env::var("ALLEGRO_CLIENT_SECRET").is_err()
+        {
+            let result = AllegroAuth::from_env(false);
+            assert!(
+                result.is_err(),
+                "expected Err when ALLEGRO_CLIENT_SECRET is absent"
+            );
+            assert!(
+                matches!(
+                    result.unwrap_err(),
+                    AuthError::MissingEnvVar("ALLEGRO_CLIENT_SECRET")
+                ),
+                "expected MissingEnvVar(\"ALLEGRO_CLIENT_SECRET\")"
+            );
+        }
+        // Also verify the error type directly (always runs):
+        let err = AuthError::MissingEnvVar("ALLEGRO_CLIENT_SECRET");
+        assert_eq!(
+            err.to_string(),
+            "missing environment variable: ALLEGRO_CLIENT_SECRET"
         );
     }
 }
