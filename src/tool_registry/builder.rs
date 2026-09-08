@@ -130,3 +130,71 @@ fn deduplicate_id(base: String, seen: &std::collections::HashSet<String>) -> Str
         n += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── sanitize_name edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_name_empty_string_returns_empty() {
+        assert_eq!(sanitize_name(""), "");
+    }
+
+    #[test]
+    fn sanitize_name_all_special_chars_returns_empty() {
+        // "---" → all replaced with '_' → collapsed to '_' → trimmed → ""
+        assert_eq!(sanitize_name("---"), "");
+    }
+
+    #[test]
+    fn sanitize_name_single_special_char_returns_empty() {
+        assert_eq!(sanitize_name("-"), "");
+        assert_eq!(sanitize_name("_"), "");
+        assert_eq!(sanitize_name("!"), "");
+    }
+
+    // ── deduplicate_id ────────────────────────────────────────────────────────
+
+    #[test]
+    fn deduplicate_id_returns_base_when_not_seen() {
+        let seen = std::collections::HashSet::new();
+        assert_eq!(deduplicate_id("allegro_foo".to_string(), &seen), "allegro_foo");
+    }
+
+    #[test]
+    fn deduplicate_id_appends_2_when_base_taken() {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert("allegro_foo".to_string());
+        assert_eq!(
+            deduplicate_id("allegro_foo".to_string(), &seen),
+            "allegro_foo_2"
+        );
+    }
+
+    #[test]
+    fn deduplicate_id_appends_3_when_base_and_2_taken() {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert("allegro_foo".to_string());
+        seen.insert("allegro_foo_2".to_string());
+        assert_eq!(
+            deduplicate_id("allegro_foo".to_string(), &seen),
+            "allegro_foo_3"
+        );
+    }
+
+    // ── build_tools with empty PathItem ──────────────────────────────────────
+
+    #[test]
+    fn build_tools_empty_path_item_yields_zero_tools() {
+        // A PathItem with no operations (no get/post/put/delete/patch/etc.)
+        // should contribute 0 tools.
+        let api: openapiv3::OpenAPI = serde_yaml::from_str(
+            "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths:\n  /empty: {}\n",
+        )
+        .unwrap();
+        let tools = build_tools(&api).unwrap();
+        assert_eq!(tools.len(), 0, "empty PathItem must yield 0 tools");
+    }
+}

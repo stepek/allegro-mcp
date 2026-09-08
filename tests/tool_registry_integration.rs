@@ -205,3 +205,115 @@ fn empty_openapi_yields_empty_registry() {
     assert_eq!(registry.len(), 0);
     assert!(registry.is_empty());
 }
+
+// ── minimal_oas3.yaml: method and path fields ─────────────────────────────────
+
+#[tokio::test]
+async fn minimal_fixture_tools_have_correct_method_and_path() {
+    let source = SchemaSource::File(fixture_path("minimal_oas3.yaml"));
+    let (api, _) = schema::load(&source).await.unwrap();
+    let registry = ToolRegistry::from_openapi(&api).unwrap();
+
+    // Both tools must have method="get" (minimal_oas3.yaml has only GET ops)
+    for tool in registry.list_tools() {
+        assert_eq!(
+            tool.method, "get",
+            "tool '{}' must have method='get'",
+            tool.id
+        );
+    }
+
+    // Paths must be the raw OAS path strings
+    let paths: Vec<&str> = registry.list_tools().iter().map(|t| t.path.as_str()).collect();
+    assert!(
+        paths.contains(&"/items"),
+        "expected /items path, got: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/items/{id}"),
+        "expected /items/{{id}} path, got: {paths:?}"
+    );
+}
+
+// ── allegro_sample.yaml: DELETE tool has no body property ────────────────────
+
+#[tokio::test]
+async fn sample_fixture_delete_tool_has_no_body_property() {
+    let source = SchemaSource::File(fixture_path("allegro_sample.yaml"));
+    let (api, _) = schema::load(&source).await.unwrap();
+    let registry = ToolRegistry::from_openapi(&api).unwrap();
+    let delete = registry.get_tool("allegro_deleteoffer").unwrap();
+    assert!(
+        delete.input_schema["properties"].get("body").is_none(),
+        "DELETE tool must not have a 'body' property (no requestBody), got: {:?}",
+        delete.input_schema["properties"]
+    );
+}
+
+// ── allegro_sample.yaml: PUT tool has offerId AND body in required ────────────
+
+#[tokio::test]
+async fn sample_fixture_put_tool_has_offer_id_and_body_required() {
+    let source = SchemaSource::File(fixture_path("allegro_sample.yaml"));
+    let (api, _) = schema::load(&source).await.unwrap();
+    let registry = ToolRegistry::from_openapi(&api).unwrap();
+    let update = registry.get_tool("allegro_updateoffer").unwrap();
+    let required: Vec<&str> = update.input_schema["required"]
+        .as_array()
+        .expect("updateOffer must have a required array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        required.contains(&"offerId"),
+        "'offerId' must be in required for PUT tool, got: {required:?}"
+    );
+    assert!(
+        required.contains(&"body"),
+        "'body' must be in required for PUT tool (required requestBody), got: {required:?}"
+    );
+}
+
+// ── deduplication: two ops with the same sanitized name get _2 suffix ─────────
+
+#[test]
+fn duplicate_operation_ids_get_deduplicated_suffix() {
+    use openapiv3::OpenAPI;
+    // Two operations whose operationIds sanitize to the same string.
+    // "getOffer" and "GetOffer" both → "getoffer" → second gets "allegro_getoffer_2"
+    let api: OpenAPI = serde_yaml::from_str(concat!(
+        "openapi: \"3.0.3\"\n",
+        "info:\n  title: t\n  version: v\n",
+        "paths:\n",
+        "  /a:\n",
+        "    get:\n",
+        "      operationId: getOffer\n",
+        "      summary: First\n",
+        "      responses:\n",
+        "        \"200\":\n",
+        "          description: OK\n",
+        "  /b:\n",
+        "    get:\n",
+        "      operationId: GetOffer\n",
+        "      summary: Second\n",
+        "      responses:\n",
+        "        \"200\":\n",
+        "          description: OK\n",
+    ))
+    .unwrap();
+    let registry = ToolRegistry::from_openapi(&api).unwrap();
+    assert_eq!(registry.len(), 2);
+    let ids: Vec<&str> = registry
+        .list_tools()
+        .iter()
+        .map(|t| t.id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"allegro_getoffer"),
+        "first tool must get the base id, got: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"allegro_getoffer_2"),
+        "second tool must get the _2 suffix, got: {ids:?}"
+    );
+}

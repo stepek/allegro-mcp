@@ -76,3 +76,77 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_registry() -> ToolRegistry {
+        let api: openapiv3::OpenAPI =
+            serde_yaml::from_str("openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n")
+                .unwrap();
+        ToolRegistry::from_openapi(&api).unwrap()
+    }
+
+    fn two_tool_registry() -> ToolRegistry {
+        let api: openapiv3::OpenAPI = serde_yaml::from_str(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /a:\n",
+            "    get:\n",
+            "      summary: A\n",
+            "      responses:\n",
+            "        \"200\":\n",
+            "          description: OK\n",
+            "  /b:\n",
+            "    post:\n",
+            "      summary: B\n",
+            "      responses:\n",
+            "        \"201\":\n",
+            "          description: Created\n",
+        ))
+        .unwrap();
+        ToolRegistry::from_openapi(&api).unwrap()
+    }
+
+    // ── is_empty ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_empty_returns_true_for_empty_registry() {
+        let registry = empty_registry();
+        assert!(registry.is_empty(), "empty registry must report is_empty=true");
+    }
+
+    #[test]
+    fn is_empty_returns_false_for_non_empty_registry() {
+        let registry = two_tool_registry();
+        assert!(
+            !registry.is_empty(),
+            "non-empty registry must report is_empty=false"
+        );
+    }
+
+    // ── filter_tools ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn filter_tools_always_true_returns_all_tools() {
+        let registry = two_tool_registry();
+        let all = registry.filter_tools(|_| true);
+        assert_eq!(
+            all.len(),
+            registry.len(),
+            "always-true predicate must return all tools"
+        );
+    }
+
+    #[test]
+    fn filter_tools_always_false_returns_empty_vec() {
+        let registry = two_tool_registry();
+        let none = registry.filter_tools(|_| false);
+        assert!(
+            none.is_empty(),
+            "always-false predicate must return empty vec"
+        );
+    }
+}
