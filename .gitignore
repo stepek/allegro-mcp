@@ -1,12 +1,14 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Secrets & tokens
 *.token.json
 .env
 .env.*
+!.env.example
+*.pem
+*.key
 
 # IDE
 .idea/
