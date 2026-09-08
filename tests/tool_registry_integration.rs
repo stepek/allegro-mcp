@@ -71,7 +71,7 @@ async fn filter_tools_by_method() {
     let (api, _) = schema::load(&source).await.unwrap();
     let registry = ToolRegistry::from_openapi(&api).unwrap();
     let get_tools = registry.filter_tools(|t| t.method == "get");
-    assert_eq!(get_tools.len(), 2); // both operations are GET
+    assert_eq!(get_tools.len(), 2); // minimal_oas3.yaml has 2 GET operations (no operationId, names derived from path)
 }
 
 // ── allegro_sample.yaml ───────────────────────────────────────────────────────
@@ -140,6 +140,18 @@ async fn sample_fixture_cyclic_ref_does_not_panic() {
     let registry = ToolRegistry::from_openapi(&api).unwrap();
     // Just verify it completes without panic
     assert_eq!(registry.len(), 5);
+
+    // Verify the cyclic Category.parent is replaced with the sentinel
+    let create = registry.get_tool("allegro_createoffer").unwrap();
+    let body = &create.input_schema["properties"]["body"];
+    // The body schema is the resolved OfferRequest — category.parent should be the sentinel
+    // (exact path depends on how deep the resolution goes, but it must not be a $ref)
+    let category_parent = &body["properties"]["category"]["properties"]["parent"];
+    assert!(
+        category_parent.get("$ref").is_none(),
+        "cyclic $ref must be replaced with sentinel, not left as $ref: {:?}",
+        category_parent
+    );
 }
 
 #[tokio::test]

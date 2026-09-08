@@ -15,20 +15,13 @@ pub fn build_input_schema(
     for param_ref in parameters {
         let param = match param_ref {
             ReferenceOr::Item(p) => p,
-            ReferenceOr::Reference { reference } => {
-                tracing::trace!("skipping $ref parameter: {}", reference);
-                continue;
-            }
+            ReferenceOr::Reference { reference } => match resolve_parameter_ref(api, reference) {
+                Some(p) => p,
+                None => continue,
+            },
         };
 
         let (name, data, is_required) = extract_parameter_parts(param);
-
-        // Skip header params that are standard HTTP headers (Authorization, etc.)
-        // x- vendor extensions on parameters: skip gracefully
-        if name.starts_with("x-") {
-            tracing::trace!("skipping x- parameter: {}", name);
-            continue;
-        }
 
         // In openapiv3 2.2.0, ParameterData has `format: ParameterSchemaOrContent`
         // NOT a `.schema` field. Extract the schema from the format enum.
@@ -51,7 +44,7 @@ pub fn build_input_schema(
         let body_schema = extract_request_body_schema(api, body_ref);
         properties.insert("body".to_string(), body_schema);
         // requestBody.required defaults to false per OAS spec
-        if is_request_body_required(body_ref) {
+        if is_request_body_required(api, body_ref) {
             required.push(Value::String("body".to_string()));
         }
     }
@@ -66,6 +59,22 @@ pub fn build_input_schema(
     }
 
     Ok(schema)
+}
+
+/// Look up a `#/components/parameters/<Name>` reference in the OpenAPI document.
+/// Only resolves a single level — chained refs are skipped with a trace log.
+fn resolve_parameter_ref<'a>(api: &'a OpenAPI, reference: &str) -> Option<&'a Parameter> {
+    let name = reference.strip_prefix("#/components/parameters/")?;
+    let components = api.components.as_ref()?;
+    match components.parameters.get(name)? {
+        ReferenceOr::Item(p) => Some(p),
+        ReferenceOr::Reference {
+            reference: inner_ref,
+        } => {
+            tracing::trace!("skipping chained $ref parameter: {}", inner_ref);
+            None
+        }
+    }
 }
 
 /// Extract (name, ParameterData, is_required) from a Parameter enum.
@@ -96,10 +105,13 @@ fn extract_parameter_parts(param: &Parameter) -> (String, &ParameterData, bool) 
 fn extract_request_body_schema(api: &OpenAPI, body_ref: &ReferenceOr<RequestBody>) -> Value {
     let body = match body_ref {
         ReferenceOr::Item(b) => b,
-        ReferenceOr::Reference { reference } => {
-            tracing::trace!("skipping $ref requestBody: {}", reference);
-            return json!({"type": "object"});
-        }
+        ReferenceOr::Reference { reference } => match resolve_request_body_ref(api, reference) {
+            Some(b) => b,
+            None => {
+                tracing::warn!("unresolvable $ref requestBody: {}", reference);
+                return json!({"type": "object"});
+            }
+        },
     };
 
     // Prefer application/json, fall back to first available
@@ -117,10 +129,28 @@ fn extract_request_body_schema(api: &OpenAPI, body_ref: &ReferenceOr<RequestBody
     }
 }
 
+/// Look up a `#/components/requestBodies/<Name>` reference in the OpenAPI document.
+/// Only resolves a single level — chained refs are treated as unresolvable.
+fn resolve_request_body_ref<'a>(api: &'a OpenAPI, reference: &str) -> Option<&'a RequestBody> {
+    let name = reference.strip_prefix("#/components/requestBodies/")?;
+    let components = api.components.as_ref()?;
+    match components.request_bodies.get(name)? {
+        ReferenceOr::Item(b) => Some(b),
+        ReferenceOr::Reference {
+            reference: inner_ref,
+        } => {
+            tracing::trace!("skipping chained $ref requestBody: {}", inner_ref);
+            None
+        }
+    }
+}
+
 /// Check if a requestBody is required.
-fn is_request_body_required(body_ref: &ReferenceOr<RequestBody>) -> bool {
+fn is_request_body_required(api: &OpenAPI, body_ref: &ReferenceOr<RequestBody>) -> bool {
     match body_ref {
         ReferenceOr::Item(b) => b.required,
-        ReferenceOr::Reference { .. } => false,
+        ReferenceOr::Reference { reference } => resolve_request_body_ref(api, reference)
+            .map(|b| b.required)
+            .unwrap_or(false),
     }
 }
