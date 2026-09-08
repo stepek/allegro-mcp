@@ -230,7 +230,11 @@ async fn minimal_fixture_tools_have_correct_method_and_path() {
     }
 
     // Paths must be the raw OAS path strings
-    let paths: Vec<&str> = registry.list_tools().iter().map(|t| t.path.as_str()).collect();
+    let paths: Vec<&str> = registry
+        .list_tools()
+        .iter()
+        .map(|t| t.path.as_str())
+        .collect();
     assert!(
         paths.contains(&"/items"),
         "expected /items path, got: {paths:?}"
@@ -332,6 +336,28 @@ async fn tool_count_equals_operation_count_minimal() {
 
 // ── JSON Schema round-trip ────────────────────────────────────────────────────
 
+fn assert_no_ref_nodes(value: &serde_json::Value, path: &str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            assert!(
+                !map.contains_key("$ref"),
+                "leaked $ref node at path '{}': {:?}",
+                path,
+                value
+            );
+            for (key, v) in map {
+                assert_no_ref_nodes(v, &format!("{}.{}", path, key));
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                assert_no_ref_nodes(v, &format!("{}[{}]", path, i));
+            }
+        }
+        _ => {}
+    }
+}
+
 #[tokio::test]
 async fn tool_input_schemas_round_trip_as_valid_json_schema() {
     let source = SchemaSource::File(fixture_path("allegro_sample.yaml"));
@@ -340,21 +366,29 @@ async fn tool_input_schemas_round_trip_as_valid_json_schema() {
 
     for tool in registry.list_tools() {
         // Round-trip through JSON string
-        let json_str = serde_json::to_string(&tool.input_schema)
-            .unwrap_or_else(|e| panic!("tool '{}' input_schema failed to serialize: {}", tool.id, e));
-        let parsed: serde_json::Value = serde_json::from_str(&json_str)
-            .unwrap_or_else(|e| panic!("tool '{}' input_schema failed to deserialize: {}", tool.id, e));
+        let json_str = serde_json::to_string(&tool.input_schema).unwrap_or_else(|e| {
+            panic!("tool '{}' input_schema failed to serialize: {}", tool.id, e)
+        });
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_else(|e| {
+            panic!(
+                "tool '{}' input_schema failed to deserialize: {}",
+                tool.id, e
+            )
+        });
 
         // Must be a JSON Schema object with type=object
         assert_eq!(
             parsed["type"], "object",
-            "tool '{}' input_schema must have type=object after round-trip", tool.id
+            "tool '{}' input_schema must have type=object after round-trip",
+            tool.id
         );
         // Must have a properties key that is an object
         assert!(
             parsed["properties"].is_object(),
-            "tool '{}' input_schema must have properties object after round-trip", tool.id
+            "tool '{}' input_schema must have properties object after round-trip",
+            tool.id
         );
+        assert_no_ref_nodes(&parsed, &format!("tool '{}'", tool.id));
     }
 }
 

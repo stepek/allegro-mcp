@@ -17,10 +17,13 @@ pub fn resolve_schema(
                 return json!({"type": "object", "description": "circular reference"});
             }
             visited.insert(reference.clone());
-            let resolved = resolve_ref_string(api, reference, visited);
-            let result = match resolved {
-                Some(schema) => schema_to_value(api, schema, visited),
-                None => {
+            let result = match resolve_ref_string(api, reference, visited) {
+                RefLookup::Found(schema) => schema_to_value(api, schema, visited),
+                RefLookup::Cycle => {
+                    tracing::trace!("cycle detected via chain at {}", reference);
+                    json!({"type": "object", "description": "circular reference"})
+                }
+                RefLookup::NotFound => {
                     tracing::trace!("unresolvable $ref: {}", reference);
                     json!({"type": "object", "description": format!("unresolved $ref: {}", reference)})
                 }
@@ -31,6 +34,16 @@ pub fn resolve_schema(
     }
 }
 
+/// Result of looking up a `$ref` in `components.schemas`.
+enum RefLookup<'a> {
+    /// The reference (possibly after following a chain) resolved to a schema.
+    Found(&'a Schema),
+    /// Following the chain led back to an already-visited reference.
+    Cycle,
+    /// The reference does not point to a known component schema.
+    NotFound,
+}
+
 /// Look up a `#/components/schemas/<Name>` reference in the OpenAPI document.
 /// Follows chained `$ref` within components (e.g. a schema that is itself a `$ref`).
 /// The `visited` set prevents infinite loops on chained cycles.
@@ -38,20 +51,28 @@ fn resolve_ref_string<'a>(
     api: &'a OpenAPI,
     reference: &str,
     visited: &mut HashSet<String>,
-) -> Option<&'a Schema> {
+) -> RefLookup<'a> {
     // Only handle local #/components/schemas/ refs
-    let name = reference.strip_prefix("#/components/schemas/")?;
-    let components = api.components.as_ref()?;
-    match components.schemas.get(name)? {
-        ReferenceOr::Item(s) => Some(s),
-        ReferenceOr::Reference {
+    let name = match reference.strip_prefix("#/components/schemas/") {
+        Some(n) => n,
+        None => return RefLookup::NotFound,
+    };
+    let components = match api.components.as_ref() {
+        Some(c) => c,
+        None => return RefLookup::NotFound,
+    };
+    match components.schemas.get(name) {
+        None => RefLookup::NotFound,
+        Some(ReferenceOr::Item(s)) => RefLookup::Found(s),
+        Some(ReferenceOr::Reference {
             reference: inner_ref,
-        } => {
+        }) => {
             // Follow chained $ref — cycle guard is already in resolve_schema caller
             if visited.contains(inner_ref.as_str()) {
-                return None; // cycle — caller will emit sentinel
+                RefLookup::Cycle
+            } else {
+                resolve_ref_string(api, inner_ref, visited)
             }
-            resolve_ref_string(api, inner_ref, visited)
         }
     }
 }
@@ -103,9 +124,7 @@ mod tests {
 
     #[test]
     fn schema_to_value_simple_string_type() {
-        let api = api_from_yaml(
-            "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
-        );
+        let api = api_from_yaml("openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n");
         let schema: Schema = serde_yaml::from_str("type: string").unwrap();
         let mut visited = HashSet::new();
         let val = schema_to_value(&api, &schema, &mut visited);
@@ -119,9 +138,7 @@ mod tests {
 
     #[test]
     fn resolve_schema_inline_returns_schema_as_json() {
-        let api = api_from_yaml(
-            "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
-        );
+        let api = api_from_yaml("openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n");
         let schema: Schema = serde_yaml::from_str("type: integer").unwrap();
         let schema_ref = ReferenceOr::Item(schema);
         let mut visited = HashSet::new();
@@ -151,9 +168,7 @@ mod tests {
 
     #[test]
     fn resolve_schema_unknown_ref_returns_unresolved_sentinel() {
-        let api = api_from_yaml(
-            "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
-        );
+        let api = api_from_yaml("openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n");
         let schema_ref: ReferenceOr<Schema> = ReferenceOr::Reference {
             reference: "#/components/schemas/DoesNotExist".to_string(),
         };
@@ -258,6 +273,14 @@ mod tests {
         assert!(
             val.get("$ref").is_none(),
             "two-node cycle must not leave a raw $ref in the result, got: {val:?}"
+        );
+        assert!(
+            val["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("circular"),
+            "two-node cycle sentinel must contain 'circular' in description, got: {:?}",
+            val["description"]
         );
     }
 }

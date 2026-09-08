@@ -160,7 +160,10 @@ mod tests {
     #[test]
     fn deduplicate_id_returns_base_when_not_seen() {
         let seen = std::collections::HashSet::new();
-        assert_eq!(deduplicate_id("allegro_foo".to_string(), &seen), "allegro_foo");
+        assert_eq!(
+            deduplicate_id("allegro_foo".to_string(), &seen),
+            "allegro_foo"
+        );
     }
 
     #[test]

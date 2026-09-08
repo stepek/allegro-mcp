@@ -82,9 +82,10 @@ mod tests {
     use super::*;
 
     fn empty_registry() -> ToolRegistry {
-        let api: openapiv3::OpenAPI =
-            serde_yaml::from_str("openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n")
-                .unwrap();
+        let api: openapiv3::OpenAPI = serde_yaml::from_str(
+            "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
+        )
+        .unwrap();
         ToolRegistry::from_openapi(&api).unwrap()
     }
 
@@ -115,7 +116,10 @@ mod tests {
     #[test]
     fn is_empty_returns_true_for_empty_registry() {
         let registry = empty_registry();
-        assert!(registry.is_empty(), "empty registry must report is_empty=true");
+        assert!(
+            registry.is_empty(),
+            "empty registry must report is_empty=true"
+        );
     }
 
     #[test]

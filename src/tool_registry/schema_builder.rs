@@ -182,9 +182,7 @@ mod tests {
 
     #[test]
     fn build_input_schema_no_params_no_body_returns_empty_object() {
-        let api = api_from_yaml(
-            "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
-        );
+        let api = api_from_yaml("openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n");
         let schema = build_input_schema(&api, &[], None).unwrap();
         assert_eq!(schema["type"], "object");
         assert!(
@@ -363,6 +361,11 @@ mod tests {
             "$ref parameter 'limit' must be resolved into properties, got: {:?}",
             schema["properties"]
         );
+        assert_eq!(
+            schema["properties"]["limit"]["type"], "integer",
+            "$ref parameter must resolve to the correct schema type, got: {:?}",
+            schema["properties"]["limit"]
+        );
     }
 
     // ── $ref requestBody in components/requestBodies resolves body property ────
@@ -396,6 +399,10 @@ mod tests {
             schema["properties"]["body"].is_object(),
             "$ref requestBody must produce a 'body' property, got: {:?}",
             schema["properties"]
+        );
+        assert!(
+            schema["properties"]["body"]["properties"]["name"].is_object(),
+            "$ref requestBody must resolve to the actual schema content, not just a placeholder object"
         );
     }
 
