@@ -16,18 +16,28 @@ struct Cli {
     verbose: u8,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    let level = match cli.verbose {
+/// Maps the `-v` count to a [`tracing::Level`].
+///
+/// | flags | level |
+/// |-------|-------|
+/// | (none) | WARN  |
+/// | `-v`   | INFO  |
+/// | `-vv`  | DEBUG |
+/// | `-vvv` or more | TRACE |
+fn verbosity_level(verbose: u8) -> tracing::Level {
+    match verbose {
         0 => tracing::Level::WARN,
         1 => tracing::Level::INFO,
         2 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
-    };
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_max_level(level)
+        .with_max_level(verbosity_level(cli.verbose))
         .with_writer(std::io::stderr)
         .init();
 
@@ -39,9 +49,26 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::verbosity_level;
+
     #[test]
-    fn smoke() {
-        // Placeholder — verifies the test harness works.
-        assert_eq!(2 + 2, 4);
+    fn default_verbosity_is_warn() {
+        assert_eq!(verbosity_level(0), tracing::Level::WARN);
+    }
+
+    #[test]
+    fn single_v_gives_info() {
+        assert_eq!(verbosity_level(1), tracing::Level::INFO);
+    }
+
+    #[test]
+    fn double_v_gives_debug() {
+        assert_eq!(verbosity_level(2), tracing::Level::DEBUG);
+    }
+
+    #[test]
+    fn triple_v_and_above_gives_trace() {
+        assert_eq!(verbosity_level(3), tracing::Level::TRACE);
+        assert_eq!(verbosity_level(255), tracing::Level::TRACE);
     }
 }
