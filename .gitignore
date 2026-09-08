@@ -1,7 +1,22 @@
+# Rust
 /target
 **/*.rs.bk
+
+# Secrets & tokens
+*.token.json
 .env
 .env.*
 !.env.example
 *.pem
 *.key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Schema cache (optional local copies)
+swagger.local.yaml
