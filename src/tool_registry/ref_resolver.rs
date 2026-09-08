@@ -196,4 +196,68 @@ mod tests {
             "sentinel description must mention 'circular', got: {desc}"
         );
     }
+
+    // ── chained $ref: SchemaA → SchemaB → SchemaC (type: string) ─────────────
+
+    #[test]
+    fn resolve_schema_chained_ref_resolves_to_final_type() {
+        // SchemaA.$ref → SchemaB.$ref → SchemaC (type: string)
+        // The resolver must follow the chain and return type: string
+        let api = api_from_yaml(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths: {}\n",
+            "components:\n",
+            "  schemas:\n",
+            "    SchemaA:\n",
+            "      $ref: \"#/components/schemas/SchemaB\"\n",
+            "    SchemaB:\n",
+            "      $ref: \"#/components/schemas/SchemaC\"\n",
+            "    SchemaC:\n",
+            "      type: string\n",
+        ));
+        let schema_ref: ReferenceOr<Schema> = ReferenceOr::Reference {
+            reference: "#/components/schemas/SchemaA".to_string(),
+        };
+        let mut visited = HashSet::new();
+        let val = resolve_schema(&api, &schema_ref, &mut visited);
+        assert_eq!(
+            val["type"], "string",
+            "chained $ref SchemaA→SchemaB→SchemaC must resolve to type: string, got: {val:?}"
+        );
+    }
+
+    // ── two-node cycle: SchemaA → SchemaB → SchemaA ───────────────────────────
+
+    #[test]
+    fn resolve_schema_two_node_cycle_returns_sentinel_without_panic() {
+        // SchemaA.$ref → SchemaB.$ref → SchemaA (two-node cycle)
+        // Must not panic or stack-overflow; must return the sentinel
+        let api = api_from_yaml(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths: {}\n",
+            "components:\n",
+            "  schemas:\n",
+            "    SchemaA:\n",
+            "      $ref: \"#/components/schemas/SchemaB\"\n",
+            "    SchemaB:\n",
+            "      $ref: \"#/components/schemas/SchemaA\"\n",
+        ));
+        let schema_ref: ReferenceOr<Schema> = ReferenceOr::Reference {
+            reference: "#/components/schemas/SchemaA".to_string(),
+        };
+        let mut visited = HashSet::new();
+        // Must not panic or stack-overflow
+        let val = resolve_schema(&api, &schema_ref, &mut visited);
+        // The result must be an object sentinel (type: object), not a raw $ref
+        assert_eq!(
+            val["type"], "object",
+            "two-node cycle must return sentinel with type: object, got: {val:?}"
+        );
+        assert!(
+            val.get("$ref").is_none(),
+            "two-node cycle must not leave a raw $ref in the result, got: {val:?}"
+        );
+    }
 }

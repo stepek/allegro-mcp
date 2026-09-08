@@ -147,6 +147,12 @@ async fn sample_fixture_cyclic_ref_does_not_panic() {
     // The body schema is the resolved OfferRequest — category.parent should be the sentinel
     // (exact path depends on how deep the resolution goes, but it must not be a $ref)
     let category_parent = &body["properties"]["category"]["properties"]["parent"];
+    // Guard: category.parent must be a resolved object, not null/missing
+    assert!(
+        category_parent.is_object(),
+        "category.parent must be a resolved object (not null/missing), got: {:?}",
+        category_parent
+    );
     assert!(
         category_parent.get("$ref").is_none(),
         "cyclic $ref must be replaced with sentinel, not left as $ref: {:?}",
@@ -272,6 +278,84 @@ async fn sample_fixture_put_tool_has_offer_id_and_body_required() {
         required.contains(&"body"),
         "'body' must be in required for PUT tool (required requestBody), got: {required:?}"
     );
+}
+
+// ── acceptance criterion: tool count == operation count ───────────────────────
+
+#[tokio::test]
+async fn tool_count_equals_operation_count_allegro_sample() {
+    use openapiv3::ReferenceOr;
+    let source = SchemaSource::File(fixture_path("allegro_sample.yaml"));
+    let (api, _) = schema::load(&source).await.unwrap();
+
+    // Count operations dynamically from the parsed API
+    let mut op_count = 0usize;
+    for (_, path_item_ref) in &api.paths.paths {
+        if let ReferenceOr::Item(item) = path_item_ref {
+            op_count += item.iter().count();
+        }
+    }
+
+    let registry = ToolRegistry::from_openapi(&api).unwrap();
+    assert_eq!(
+        registry.len(),
+        op_count,
+        "tool count must equal operation count: registry has {}, API has {}",
+        registry.len(),
+        op_count
+    );
+}
+
+#[tokio::test]
+async fn tool_count_equals_operation_count_minimal() {
+    use openapiv3::ReferenceOr;
+    let source = SchemaSource::File(fixture_path("minimal_oas3.yaml"));
+    let (api, _) = schema::load(&source).await.unwrap();
+
+    // Count operations dynamically from the parsed API
+    let mut op_count = 0usize;
+    for (_, path_item_ref) in &api.paths.paths {
+        if let ReferenceOr::Item(item) = path_item_ref {
+            op_count += item.iter().count();
+        }
+    }
+
+    let registry = ToolRegistry::from_openapi(&api).unwrap();
+    assert_eq!(
+        registry.len(),
+        op_count,
+        "tool count must equal operation count: registry has {}, API has {}",
+        registry.len(),
+        op_count
+    );
+}
+
+// ── JSON Schema round-trip ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tool_input_schemas_round_trip_as_valid_json_schema() {
+    let source = SchemaSource::File(fixture_path("allegro_sample.yaml"));
+    let (api, _) = schema::load(&source).await.unwrap();
+    let registry = ToolRegistry::from_openapi(&api).unwrap();
+
+    for tool in registry.list_tools() {
+        // Round-trip through JSON string
+        let json_str = serde_json::to_string(&tool.input_schema)
+            .unwrap_or_else(|e| panic!("tool '{}' input_schema failed to serialize: {}", tool.id, e));
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .unwrap_or_else(|e| panic!("tool '{}' input_schema failed to deserialize: {}", tool.id, e));
+
+        // Must be a JSON Schema object with type=object
+        assert_eq!(
+            parsed["type"], "object",
+            "tool '{}' input_schema must have type=object after round-trip", tool.id
+        );
+        // Must have a properties key that is an object
+        assert!(
+            parsed["properties"].is_object(),
+            "tool '{}' input_schema must have properties object after round-trip", tool.id
+        );
+    }
 }
 
 // ── deduplication: two ops with the same sanitized name get _2 suffix ─────────

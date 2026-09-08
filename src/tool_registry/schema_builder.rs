@@ -334,4 +334,218 @@ mod tests {
         }
         // If required is absent entirely, that's also fine (nothing required)
     }
+
+    // ── $ref parameter in components/parameters resolves into properties ───────
+
+    #[test]
+    fn build_input_schema_ref_parameter_resolves_into_properties() {
+        let schema = schema_from_op_yaml(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /items:\n",
+            "    get:\n",
+            "      parameters:\n",
+            "        - $ref: \"#/components/parameters/LimitParam\"\n",
+            "      responses:\n",
+            "        \"200\":\n",
+            "          description: OK\n",
+            "components:\n",
+            "  parameters:\n",
+            "    LimitParam:\n",
+            "      name: limit\n",
+            "      in: query\n",
+            "      schema:\n",
+            "        type: integer\n",
+        ));
+        assert!(
+            schema["properties"]["limit"].is_object(),
+            "$ref parameter 'limit' must be resolved into properties, got: {:?}",
+            schema["properties"]
+        );
+    }
+
+    // ── $ref requestBody in components/requestBodies resolves body property ────
+
+    #[test]
+    fn build_input_schema_ref_request_body_resolves_body_property() {
+        let schema = schema_from_op_yaml(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /items:\n",
+            "    post:\n",
+            "      requestBody:\n",
+            "        $ref: \"#/components/requestBodies/ItemBody\"\n",
+            "      responses:\n",
+            "        \"201\":\n",
+            "          description: Created\n",
+            "components:\n",
+            "  requestBodies:\n",
+            "    ItemBody:\n",
+            "      required: true\n",
+            "      content:\n",
+            "        application/json:\n",
+            "          schema:\n",
+            "            type: object\n",
+            "            properties:\n",
+            "              name:\n",
+            "                type: string\n",
+        ));
+        assert!(
+            schema["properties"]["body"].is_object(),
+            "$ref requestBody must produce a 'body' property, got: {:?}",
+            schema["properties"]
+        );
+    }
+
+    // ── header parameter appears in properties and respects required flag ──────
+
+    #[test]
+    fn build_input_schema_required_header_param_in_required() {
+        let schema = schema_from_op_yaml(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /items:\n",
+            "    get:\n",
+            "      parameters:\n",
+            "        - name: X-Request-Id\n",
+            "          in: header\n",
+            "          required: true\n",
+            "          schema:\n",
+            "            type: string\n",
+            "      responses:\n",
+            "        \"200\":\n",
+            "          description: OK\n",
+        ));
+        assert!(
+            schema["properties"]["X-Request-Id"].is_object(),
+            "header param 'X-Request-Id' must appear in properties, got: {:?}",
+            schema["properties"]
+        );
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required must be present for required header param")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            required.contains(&"X-Request-Id"),
+            "required header param must be in required array, got: {required:?}"
+        );
+    }
+
+    #[test]
+    fn build_input_schema_optional_header_param_not_in_required() {
+        let schema = schema_from_op_yaml(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /items:\n",
+            "    get:\n",
+            "      parameters:\n",
+            "        - name: X-Trace-Id\n",
+            "          in: header\n",
+            "          required: false\n",
+            "          schema:\n",
+            "            type: string\n",
+            "      responses:\n",
+            "        \"200\":\n",
+            "          description: OK\n",
+        ));
+        assert!(
+            schema["properties"]["X-Trace-Id"].is_object(),
+            "optional header param must still appear in properties, got: {:?}",
+            schema["properties"]
+        );
+        // required array must be absent or must not contain the header name
+        if let Some(required) = schema.get("required") {
+            let required_names: Vec<&str> = required
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                !required_names.contains(&"X-Trace-Id"),
+                "optional header param must NOT be in required, got: {required_names:?}"
+            );
+        }
+    }
+
+    // ── cookie parameter appears in properties and respects required flag ──────
+
+    #[test]
+    fn build_input_schema_required_cookie_param_in_required() {
+        let schema = schema_from_op_yaml(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /items:\n",
+            "    get:\n",
+            "      parameters:\n",
+            "        - name: session\n",
+            "          in: cookie\n",
+            "          required: true\n",
+            "          schema:\n",
+            "            type: string\n",
+            "      responses:\n",
+            "        \"200\":\n",
+            "          description: OK\n",
+        ));
+        assert!(
+            schema["properties"]["session"].is_object(),
+            "cookie param 'session' must appear in properties, got: {:?}",
+            schema["properties"]
+        );
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required must be present for required cookie param")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            required.contains(&"session"),
+            "required cookie param must be in required array, got: {required:?}"
+        );
+    }
+
+    #[test]
+    fn build_input_schema_optional_cookie_param_not_in_required() {
+        let schema = schema_from_op_yaml(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /items:\n",
+            "    get:\n",
+            "      parameters:\n",
+            "        - name: pref\n",
+            "          in: cookie\n",
+            "          required: false\n",
+            "          schema:\n",
+            "            type: string\n",
+            "      responses:\n",
+            "        \"200\":\n",
+            "          description: OK\n",
+        ));
+        assert!(
+            schema["properties"]["pref"].is_object(),
+            "optional cookie param must still appear in properties, got: {:?}",
+            schema["properties"]
+        );
+        // required array must be absent or must not contain the cookie name
+        if let Some(required) = schema.get("required") {
+            let required_names: Vec<&str> = required
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                !required_names.contains(&"pref"),
+                "optional cookie param must NOT be in required, got: {required_names:?}"
+            );
+        }
+    }
 }

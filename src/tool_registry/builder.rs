@@ -197,4 +197,27 @@ mod tests {
         let tools = build_tools(&api).unwrap();
         assert_eq!(tools.len(), 0, "empty PathItem must yield 0 tools");
     }
+
+    // ── build_tools with $ref path item contributes 0 tools ──────────────────
+
+    #[test]
+    fn build_tools_ref_path_item_yields_zero_tools() {
+        // A path item that is a $ref (ReferenceOr::Reference) must be skipped
+        // entirely — it should contribute 0 tools to the registry.
+        let api: openapiv3::OpenAPI = serde_yaml::from_str(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /ref-path:\n",
+            "    $ref: \"#/components/pathItems/MyPath\"\n",
+            "components: {}\n",
+        ))
+        .unwrap();
+        let tools = build_tools(&api).unwrap();
+        assert_eq!(
+            tools.len(),
+            0,
+            "$ref path item must be skipped and contribute 0 tools, got: {tools:?}"
+        );
+    }
 }
