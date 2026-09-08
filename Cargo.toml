@@ -12,6 +12,10 @@ readme      = "README.md"
 name = "allegro-mcp"
 path = "src/main.rs"
 
+[lib]
+name = "allegro_mcp"
+path = "src/lib.rs"
+
 [dependencies]
 # MCP SDK — official Rust implementation
 rmcp            = { version = "3.2.0", features = ["server", "transport-io"] }
@@ -43,6 +47,12 @@ tracing-subscriber  = { version = "0.3.19", features = ["env-filter", "fmt"] }
 
 # Platform directories (config/cache paths)
 dirs            = "6.0.0"
+
+# Hashing (schema cache drift detection)
+sha2            = "0.10.8"
+
+[dev-dependencies]
+tempfile        = "3.14.0"
 
 [profile.release]
 strip    = true

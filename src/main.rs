@@ -3,9 +3,10 @@
 //! Phase 4: client_credentials auth with in-memory token cache.
 
 mod auth;
+mod schema;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{debug, info, warn};
 
 use crate::auth::AllegroAuth;
@@ -15,12 +16,38 @@ use crate::auth::AllegroAuth;
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Increase log verbosity (repeat for more: -v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
     /// Use the Allegro sandbox environment instead of production.
     #[arg(long, default_value_t = false)]
     sandbox: bool,
+
+    /// Override the schema URL (default: https://developer.allegro.pl/swagger.yaml)
+    #[arg(long, global = true)]
+    schema_url: Option<String>,
+
+    /// Use a local schema file instead of fetching from URL
+    #[arg(long, global = true)]
+    schema_file: Option<std::path::PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Schema inspection commands
+    Schema {
+        #[command(subcommand)]
+        action: SchemaAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SchemaAction {
+    /// Print path/operation/parameter counts from the schema
+    Stats,
 }
 
 /// Maps the `-v` count to a [`tracing::Level`].
@@ -110,7 +137,30 @@ async fn main() -> Result<()> {
         );
     }
 
-    // TODO(gh-5): initialise MCP server and connect stdio transport
+    let source = if let Some(path) = cli.schema_file {
+        schema::SchemaSource::File(path)
+    } else if let Some(url) = cli.schema_url {
+        schema::SchemaSource::Url(url)
+    } else {
+        schema::SchemaSource::default()
+    };
+
+    match cli.command {
+        Some(Commands::Schema {
+            action: SchemaAction::Stats,
+        }) => {
+            let (api, raw) = schema::load(&source).await?;
+            let stats = schema::compute_stats(&api, &raw);
+            println!("Paths:      {}", stats.path_count);
+            println!("Operations: {}", stats.operation_count);
+            println!("Parameters: {}", stats.parameter_count);
+            println!("SHA-256:    {}", stats.sha256);
+        }
+        None => {
+            // TODO(gh-5): initialise MCP server and connect stdio transport
+        }
+    }
+
     Ok(())
 }
 
