@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
             println!("SHA-256:    {}", stats.sha256);
         }
         None => {
-            // TODO(gh-5): initialise MCP server and connect stdio transport
+            tracing::warn!("No subcommand — MCP server mode not yet implemented");
         }
     }
 
