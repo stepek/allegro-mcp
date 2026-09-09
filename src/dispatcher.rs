@@ -100,14 +100,7 @@ pub async fn dispatch(
     tool_def: &crate::tool_registry::ToolDef,
     arguments: serde_json::Map<String, Value>,
 ) -> Result<String, String> {
-    dispatch_with_base(
-        auth,
-        http,
-        allegro_api_base(sandbox),
-        tool_def,
-        arguments,
-    )
-    .await
+    dispatch_with_base(auth, http, allegro_api_base(sandbox), tool_def, arguments).await
 }
 
 /// Like [`dispatch`] but accepts an explicit API base URL instead of deriving

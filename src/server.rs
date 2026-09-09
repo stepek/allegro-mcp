@@ -114,23 +114,11 @@ impl rmcp::ServerHandler for AllegroServer {
         let arguments = request.arguments.unwrap_or_default();
 
         let dispatch_result = if let Some(ref base) = self.api_base_url {
-            crate::dispatcher::dispatch_with_base(
-                &self.auth,
-                &self.http,
-                base,
-                tool_def,
-                arguments,
-            )
-            .await
+            crate::dispatcher::dispatch_with_base(&self.auth, &self.http, base, tool_def, arguments)
+                .await
         } else {
-            crate::dispatcher::dispatch(
-                &self.auth,
-                &self.http,
-                self.sandbox,
-                tool_def,
-                arguments,
-            )
-            .await
+            crate::dispatcher::dispatch(&self.auth, &self.http, self.sandbox, tool_def, arguments)
+                .await
         };
 
         match dispatch_result {

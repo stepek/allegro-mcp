@@ -280,10 +280,9 @@ async fn test_initialize_response_advertises_tools_capability() {
 #[tokio::test]
 async fn test_list_tools_empty_registry_returns_empty_array() {
     // Build an empty registry from an inline schema with no paths.
-    let api: OpenAPI = serde_yaml::from_str(
-        "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
-    )
-    .expect("parse inline schema");
+    let api: OpenAPI =
+        serde_yaml::from_str("openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n")
+            .expect("parse inline schema");
     let registry = ToolRegistry::from_openapi(&api).expect("build registry failed");
     assert_eq!(registry.len(), 0, "empty schema must produce 0 tools");
 
@@ -675,9 +674,8 @@ async fn test_call_tool_happy_path_returns_mocked_body() {
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                json!({ "access_token": "test-token", "expires_in": 3600 }),
-            ),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "test-token", "expires_in": 3600 })),
         )
         .mount(&mock_server)
         .await;
@@ -685,10 +683,7 @@ async fn test_call_tool_happy_path_returns_mocked_body() {
     // Mock the GET /sale/offers endpoint.
     Mock::given(method("GET"))
         .and(path("/sale/offers"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"offers":[],"count":0}"#),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"offers":[],"count":0}"#))
         .mount(&mock_server)
         .await;
 
@@ -708,8 +703,7 @@ async fn test_call_tool_happy_path_returns_mocked_body() {
         mock_server.uri(),
     );
     // Inject the mock server as the API base URL so dispatch hits the mock.
-    let handler = AllegroServer::new(registry, auth, false)
-        .with_api_base_url(mock_server.uri());
+    let handler = AllegroServer::new(registry, auth, false).with_api_base_url(mock_server.uri());
 
     let (mut client, server_handle) = spawn_server(handler);
     initialize(&mut client).await;
@@ -765,9 +759,8 @@ async fn test_call_tool_response_over_100kb_is_truncated() {
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                json!({ "access_token": "test-token", "expires_in": 3600 }),
-            ),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "test-token", "expires_in": 3600 })),
         )
         .mount(&mock_server)
         .await;
@@ -794,8 +787,7 @@ async fn test_call_tool_response_over_100kb_is_truncated() {
         "test-secret".to_string(),
         mock_server.uri(),
     );
-    let handler = AllegroServer::new(registry, auth, false)
-        .with_api_base_url(mock_server.uri());
+    let handler = AllegroServer::new(registry, auth, false).with_api_base_url(mock_server.uri());
 
     let (mut client, server_handle) = spawn_server(handler);
     initialize(&mut client).await;
@@ -848,18 +840,15 @@ async fn test_call_tool_with_api_base_url_override_succeeds() {
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                json!({ "access_token": "sandbox-token", "expires_in": 3600 }),
-            ),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "sandbox-token", "expires_in": 3600 })),
         )
         .mount(&mock_server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/sale/offers"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(r#"{"sandbox":true}"#),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"sandbox":true}"#))
         .mount(&mock_server)
         .await;
 
@@ -879,8 +868,7 @@ async fn test_call_tool_with_api_base_url_override_succeeds() {
     );
     // sandbox=true, API base overridden to the mock server — the override
     // must take precedence over the sandbox flag's default URL.
-    let handler = AllegroServer::new(registry, auth, true)
-        .with_api_base_url(mock_server.uri());
+    let handler = AllegroServer::new(registry, auth, true).with_api_base_url(mock_server.uri());
 
     let (mut client, server_handle) = spawn_server(handler);
     initialize(&mut client).await;
@@ -931,9 +919,8 @@ async fn test_call_tool_api_4xx_returns_tool_level_error() {
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                json!({ "access_token": "test-token", "expires_in": 3600 }),
-            ),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "test-token", "expires_in": 3600 })),
         )
         .mount(&mock_server)
         .await;
@@ -942,8 +929,9 @@ async fn test_call_tool_api_4xx_returns_tool_level_error() {
     Mock::given(method("GET"))
         .and(path("/sale/offers"))
         .respond_with(
-            ResponseTemplate::new(404)
-                .set_body_string(r#"{"errors":[{"code":"NotFound","message":"Resource not found"}]}"#),
+            ResponseTemplate::new(404).set_body_string(
+                r#"{"errors":[{"code":"NotFound","message":"Resource not found"}]}"#,
+            ),
         )
         .mount(&mock_server)
         .await;
@@ -962,8 +950,7 @@ async fn test_call_tool_api_4xx_returns_tool_level_error() {
         "test-secret".to_string(),
         mock_server.uri(),
     );
-    let handler = AllegroServer::new(registry, auth, false)
-        .with_api_base_url(mock_server.uri());
+    let handler = AllegroServer::new(registry, auth, false).with_api_base_url(mock_server.uri());
 
     let (mut client, server_handle) = spawn_server(handler);
     initialize(&mut client).await;
@@ -1032,10 +1019,7 @@ async fn test_server_exits_cleanly_on_client_eof() {
 
     let (server_transport, client_transport) = tokio::io::duplex(65536);
     let server_handle = tokio::spawn(async move {
-        let running = handler
-            .serve(server_transport)
-            .await
-            .expect("serve failed");
+        let running = handler.serve(server_transport).await.expect("serve failed");
         let _ = running.waiting().await;
     });
 
@@ -1047,11 +1031,7 @@ async fn test_server_exits_cleanly_on_client_eof() {
     drop(client);
 
     // The server task must exit on its own within 2 seconds.
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        server_handle,
-    )
-    .await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), server_handle).await;
 
     assert!(
         result.is_ok(),
@@ -1081,4 +1061,3 @@ async fn test_server_exits_cleanly_on_client_eof() {
 // by the subscriber initialised in `main`. Any future change that adds a
 // `tracing_subscriber` writing to stdout would break this invariant and
 // should be caught in code review.
-
