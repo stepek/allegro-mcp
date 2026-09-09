@@ -2,6 +2,11 @@
 
 Source docs: [Auth & OAuth](https://developer.allegro.pl/tutorials/uwierzytelnianie-i-autoryzacja-zlq9e75GdIR) · [Basics incl. User-Agent](https://developer.allegro.pl/tutorials/informacje-podstawowe-b21569boAI1#user-agent) · [OpenAPI schema](https://developer.allegro.pl/swagger.yaml)
 
+## Distribution decision
+
+**Docker image on GHCR + Claude Code integration (`claude mcp add`) ONLY.**
+No crates.io publish, no cargo-dist binary matrix.
+
 ## Phases
 
 1. **Bootstrap** — cargo project, CI, repo hygiene
@@ -15,6 +20,6 @@ Source docs: [Auth & OAuth](https://developer.allegro.pl/tutorials/uwierzytelnia
 9. **Resilience** — 429 backoff, Allegro error JSON → tool errors, Trace-Id passthrough
 10. **Scoping & safety** — allow/deny lists, read-only mode, tool-count guard
 11. **Tests** — wiremock-based integration tests per auth flow + engine
-12. **Release** — crates.io, cargo install, Docker, Claude Desktop config example
+12. **Release** — Docker image on GHCR + Claude Code integration (`claude mcp add`); no crates.io, no binary matrix
 
 Each phase = one GitHub issue with acceptance criteria.
