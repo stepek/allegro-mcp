@@ -21,7 +21,8 @@ pub struct AllegroServer {
 
 impl AllegroServer {
     /// Constructs a new [`AllegroServer`] from an already-built registry and
-    /// auth manager.
+    /// auth manager. Uses the default (ToS-compliant UA) pooled client; pass
+    /// a config-driven one via [`Self::with_http_client`].
     pub fn new(
         registry: crate::tool_registry::ToolRegistry,
         auth: crate::auth::AllegroAuth,
@@ -30,10 +31,24 @@ impl AllegroServer {
         Self {
             registry: Arc::new(registry),
             auth: Arc::new(auth),
-            http: reqwest::Client::new(),
+            http: crate::http::default_client(),
             sandbox,
             api_base_url: None,
         }
+    }
+
+    /// Replaces the pooled HTTP client with a config-driven one (built via
+    /// [`crate::http::build_client`] in `main`, so the configured
+    /// User-Agent / Accept-Language apply to dispatched API calls).
+    ///
+    /// Must remain `pub` (not `pub(crate)`) because integration tests under
+    /// `tests/` are compiled as a separate crate and can only see `pub`
+    /// items; `#[doc(hidden)]` keeps it out of the public docs. Production
+    /// callers get it wired automatically in `main`.
+    #[doc(hidden)]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
     }
 
     /// Override the Allegro API base URL used for dispatching tool calls.
@@ -150,6 +165,7 @@ mod tests {
             }),
             method: method.to_string(),
             path: "/test/{foo}".to_string(),
+            accept_media_type: None,
         }
     }
 
@@ -234,6 +250,7 @@ mod tests {
             input_schema: serde_json::Value::Null,
             method: "get".to_string(),
             path: "/test".to_string(),
+            accept_media_type: None,
         };
         let tool = tool_def_to_rmcp(&def);
         // Must not panic; input_schema must be an empty map.

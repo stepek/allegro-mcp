@@ -1,7 +1,9 @@
 //! allegro-mcp — MCP server for the Allegro REST API.
 
 mod auth;
+mod config;
 mod dispatcher;
+mod http;
 mod schema;
 mod server;
 mod tool_registry;
@@ -29,6 +31,15 @@ struct Cli {
     /// Use a local schema file instead of fetching from URL
     #[arg(long, global = true)]
     schema_file: Option<std::path::PathBuf>,
+
+    /// Path to the config file (default: discover allegro-mcp.toml)
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
+
+    /// Override the User-Agent sent on every request
+    /// (format: "AppName/Version (+URL)")
+    #[arg(long, global = true)]
+    user_agent: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -86,21 +97,50 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!(sandbox = cli.sandbox, "allegro-mcp starting");
-
-    let source = if let Some(path) = cli.schema_file {
-        schema::SchemaSource::File(path)
-    } else if let Some(url) = cli.schema_url {
-        schema::SchemaSource::Url(url)
-    } else {
-        schema::SchemaSource::default()
+    // Re-package CLI flags for the config pipeline (config.rs stays
+    // clap-independent). A bare `--sandbox` flag can only express `true`,
+    // so `None` means "not specified" and env/file values survive.
+    let overrides = config::CliOverrides {
+        sandbox: cli.sandbox.then_some(true),
+        user_agent: cli.user_agent.clone(),
+        schema_url: cli.schema_url.clone(),
+        schema_file: cli.schema_file.clone(),
+        config: cli.config.clone(),
     };
+
+    // Config load = the User-Agent validation gate: nothing network-facing
+    // (schema fetch, auth, client building) happens before it, so an
+    // invalid UA aborts startup with zero network syscalls.
+    let cfg = config::Config::load(&overrides)?;
+
+    let user_agent = cfg
+        .user_agent
+        .clone()
+        .unwrap_or_else(|| http::DEFAULT_USER_AGENT.to_owned());
+    info!(
+        sandbox = cfg.sandbox,
+        user_agent = %user_agent,
+        auth_flow = ?cfg.auth_flow,
+        token_path = ?cfg.token_path,
+        tools_filters = ?cfg.tools,
+        "allegro-mcp starting"
+    );
+
+    // Two config-driven clients: api_client (auth + API, no timeout) and
+    // schema_client (10 s timeout) — both shared immutably.
+    let api_client = http::build_client(&user_agent, &cfg.accept_language)?;
+    let schema_client = http::build_schema_client(&user_agent, &cfg.accept_language)?;
+
+    // Schema-source resolution shared by all three modes; the merged config
+    // already encodes CLI file > CLI url > env file > env url > config file
+    // > config url, with `file` winning whenever both fields are set.
+    let source = resolve_schema_source(&cfg);
 
     match cli.command {
         Some(Commands::Schema {
             action: SchemaAction::Stats,
         }) => {
-            let (api, raw) = schema::load(&source).await?;
+            let (api, raw) = schema::load_with_client(&schema_client, &source).await?;
             let stats = schema::compute_stats(&api, &raw);
             println!("Paths:      {}", stats.path_count);
             println!("Operations: {}", stats.operation_count);
@@ -110,7 +150,7 @@ async fn main() -> Result<()> {
         Some(Commands::Tools {
             action: ToolsAction::List,
         }) => {
-            let (api, _raw) = schema::load(&source).await?;
+            let (api, _raw) = schema::load_with_client(&schema_client, &source).await?;
             let registry = tool_registry::ToolRegistry::from_openapi(&api)?;
             println!("Tools: {}", registry.len());
             for tool in registry.list_tools().iter().take(5) {
@@ -121,22 +161,55 @@ async fn main() -> Result<()> {
             }
         }
         None => {
-            run_mcp_server(cli.sandbox, source).await?;
+            run_mcp_server(cfg, api_client, schema_client, source).await?;
         }
     }
 
     Ok(())
 }
 
+/// Resolves the effective schema source from the merged config
+/// (file > url > default).
+fn resolve_schema_source(cfg: &config::Config) -> schema::SchemaSource {
+    if let Some(file) = &cfg.schema_file {
+        schema::SchemaSource::File(file.clone())
+    } else if let Some(url) = &cfg.schema_url {
+        schema::SchemaSource::Url(url.clone())
+    } else {
+        schema::SchemaSource::default()
+    }
+}
+
 /// Runs the MCP server over stdio: builds auth, loads the schema, builds the
 /// tool registry, and serves `tools/list` + `tools/call` until stdin EOF.
-async fn run_mcp_server(sandbox: bool, source: schema::SchemaSource) -> Result<()> {
-    tracing::info!(sandbox, "starting MCP server (stdio transport)");
+async fn run_mcp_server(
+    cfg: config::Config,
+    api_client: reqwest::Client,
+    schema_client: reqwest::Client,
+    source: schema::SchemaSource,
+) -> Result<()> {
+    tracing::info!(
+        sandbox = cfg.sandbox,
+        "starting MCP server (stdio transport)"
+    );
 
-    let auth = auth::AllegroAuth::from_env(sandbox)
-        .map_err(|e| anyhow::anyhow!("auth init failed: {e}"))?;
+    // Client credentials stay in the classic env vars (auth module contract);
+    // everything else about the token request (UA, Accept-Language, host,
+    // scopes) comes from the config-driven client below.
+    let client_id = std::env::var("ALLEGRO_CLIENT_ID")
+        .map_err(|_| anyhow::anyhow!("missing environment variable: ALLEGRO_CLIENT_ID"))?;
+    let client_secret = std::env::var("ALLEGRO_CLIENT_SECRET")
+        .map_err(|_| anyhow::anyhow!("missing environment variable: ALLEGRO_CLIENT_SECRET"))?;
 
-    let (api, _raw) = schema::load(&source)
+    let auth = auth::AllegroAuth::with_http_client(
+        client_id,
+        client_secret,
+        config::auth_base_url(cfg.sandbox).to_owned(),
+        api_client.clone(),
+    )
+    .with_scopes(cfg.scopes.clone());
+
+    let (api, _raw) = schema::load_with_client(&schema_client, &source)
         .await
         .map_err(|e| anyhow::anyhow!("schema load failed: {e}"))?;
     let registry = tool_registry::ToolRegistry::from_openapi(&api)
@@ -144,7 +217,8 @@ async fn run_mcp_server(sandbox: bool, source: schema::SchemaSource) -> Result<(
 
     tracing::info!(tool_count = registry.len(), "tool registry built");
 
-    let handler = server::AllegroServer::new(registry, auth, sandbox);
+    let handler =
+        server::AllegroServer::new(registry, auth, cfg.sandbox).with_http_client(api_client);
 
     let transport = rmcp::transport::io::stdio();
 

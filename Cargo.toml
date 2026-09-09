@@ -51,6 +51,9 @@ dirs            = "6.0.0"
 # Hashing (schema cache drift detection)
 sha2            = "0.10.8"
 
+# Config file parsing (allegro-mcp.toml)
+toml            = "1"
+
 [dev-dependencies]
 tempfile        = "3.14.0"
 serial_test     = "3.2.0"

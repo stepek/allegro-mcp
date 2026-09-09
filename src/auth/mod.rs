@@ -17,6 +17,11 @@ use tracing::{debug, info, warn};
 /// Errors that can occur during authentication.
 #[derive(Debug, Error)]
 pub enum AuthError {
+    /// Constructed by [`AllegroAuth::from_env`] (library/tests API). The
+    /// binary reads the same env vars directly in `run_mcp_server` and maps
+    /// a missing var to an `anyhow` error, so this variant is bin-tree dead
+    /// code — same pattern as `MalformedResponse` below.
+    #[allow(dead_code)]
     #[error("missing environment variable: {0}")]
     MissingEnvVar(&'static str),
 
@@ -88,7 +93,13 @@ pub struct AllegroAuth {
     client_secret: String,
     /// Base URL for the auth endpoint, e.g. `https://allegro.pl`.
     auth_base_url: String,
+    /// Shared HTTP client — always built by `crate::http` so token requests
+    /// carry the ToS-compliant User-Agent + Accept-Language.
     http: Client,
+    /// OAuth2 scopes requested on the token fetch (space-joined into the
+    /// `scope` form param when non-empty). Empty ⇒ byte-identical request
+    /// body to the scope-less flow.
+    scopes: Vec<String>,
     cache: RwLock<Option<CachedToken>>,
 }
 
@@ -109,6 +120,11 @@ impl AllegroAuth {
     /// Reads `ALLEGRO_CLIENT_ID` and `ALLEGRO_CLIENT_SECRET`.
     ///
     /// Set `sandbox = true` to target `allegro.pl.allegrosandbox.pl`.
+    ///
+    /// Library/tests API: the binary reads the same env vars directly in
+    /// `run_mcp_server` (so it can inject the config-driven HTTP client),
+    /// hence the bin-tree `dead_code` allow.
+    #[allow(dead_code)]
     pub fn from_env(sandbox: bool) -> Result<Self, AuthError> {
         let client_id = std::env::var("ALLEGRO_CLIENT_ID")
             .map_err(|_| AuthError::MissingEnvVar("ALLEGRO_CLIENT_ID"))?;
@@ -124,13 +140,19 @@ impl AllegroAuth {
     }
 
     /// Constructs an [`AllegroAuth`] with explicit credentials.
+    ///
+    /// The auth host is selected by [`crate::config::auth_base_url`] — the
+    /// same single source of truth the API dispatcher uses, so the sandbox
+    /// flag always swaps both hosts.
+    ///
+    /// Library/tests API (see [`Self::from_env`] for the bin-tree rationale).
+    #[allow(dead_code)]
     pub fn new(client_id: String, client_secret: String, sandbox: bool) -> Self {
-        let auth_base_url = if sandbox {
-            "https://allegro.pl.allegrosandbox.pl".to_owned()
-        } else {
-            "https://allegro.pl".to_owned()
-        };
-        Self::with_base_url(client_id, client_secret, auth_base_url)
+        Self::with_base_url(
+            client_id,
+            client_secret,
+            crate::config::auth_base_url(sandbox).to_owned(),
+        )
     }
 
     /// Test-only constructor for injecting a custom auth base URL.
@@ -139,17 +161,51 @@ impl AllegroAuth {
     /// `tests/` are compiled as a separate crate and can only see `pub`
     /// items; `#[doc(hidden)]` keeps it out of the public docs so it isn't
     /// mistaken for a supported production API. Production callers should
-    /// use [`Self::new`] or [`Self::from_env`] instead.
+    /// use [`Self::new`] or [`Self::from_env`] instead. The `dead_code`
+    /// allow covers the bin tree, where only tests construct it.
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn with_base_url(client_id: String, client_secret: String, auth_base_url: String) -> Self {
+        Self::with_http_client(
+            client_id,
+            client_secret,
+            auth_base_url,
+            crate::http::default_client(),
+        )
+    }
+
+    /// Config-wiring constructor: explicit auth base URL AND explicit HTTP
+    /// client (built via [`crate::http::build_client`] in `main`), so a
+    /// config-driven User-Agent / Accept-Language applies to token requests
+    /// too. Same visibility rationale as [`Self::with_base_url`]: `pub` for
+    /// the integration tests under `tests/`, `#[doc(hidden)]` to keep it out
+    /// of the public docs.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_http_client(
+        client_id: String,
+        client_secret: String,
+        auth_base_url: String,
+        http: Client,
+    ) -> Self {
         info!(auth_base_url, "AllegroAuth initialised");
         Self {
             client_id,
             client_secret,
             auth_base_url,
-            http: Client::new(),
+            http,
+            scopes: Vec::new(),
             cache: RwLock::new(None),
         }
+    }
+
+    /// Builder-style setter for the OAuth2 scopes requested on each token
+    /// fetch. When non-empty, [`Self::fetch_token`] sends the standard
+    /// `scope` form param (space-joined values); an empty list keeps the
+    /// request body identical to the scope-less flow.
+    pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
+        self.scopes = scopes;
+        self
     }
 
     /// Returns a valid access token, fetching a new one if necessary.
@@ -210,13 +266,22 @@ impl AllegroAuth {
     /// Performs the actual HTTP call to the token endpoint.
     async fn fetch_token(&self) -> Result<TokenResponse, AuthError> {
         let url = format!("{}/auth/oauth/token", self.auth_base_url);
-        debug!(url, "fetching token");
+        debug!(url, scopes = self.scopes.len(), "fetching token");
+
+        // OAuth2 form body: the `scope` param is appended only when scopes
+        // are configured — an empty list must produce a byte-identical body
+        // to the scope-less flow.
+        let scope_param = self.scopes.join(" ");
+        let mut form: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
+        if !scope_param.is_empty() {
+            form.push(("scope", scope_param.as_str()));
+        }
 
         let resp = self
             .http
             .post(&url)
             .basic_auth(&self.client_id, Some(&self.client_secret))
-            .form(&[("grant_type", "client_credentials")])
+            .form(&form)
             .send()
             .await?
             .error_for_status()?;
@@ -379,6 +444,46 @@ mod tests {
             "https://allegro.pl.allegrosandbox.pl",
             "sandbox auth_base_url must be 'https://allegro.pl.allegrosandbox.pl'"
         );
+    }
+
+    /// Host selection must delegate to (and therefore never diverge from)
+    /// the config module's single source of truth — one flag, both hosts.
+    #[test]
+    fn new_delegates_host_to_config_helper() {
+        let prod = AllegroAuth::new("id".to_owned(), "secret".to_owned(), false);
+        let sandbox = AllegroAuth::new("id".to_owned(), "secret".to_owned(), true);
+        assert_eq!(prod.auth_base_url(), crate::config::auth_base_url(false));
+        assert_eq!(sandbox.auth_base_url(), crate::config::auth_base_url(true));
+    }
+
+    /// `with_http_client` must store the provided base URL and accept the
+    /// config-driven client without panicking (the client itself is only
+    /// observable via integration tests, which assert its custom UA on the
+    /// wire).
+    #[test]
+    fn with_http_client_stores_base_url_and_default_scopes() {
+        let auth = AllegroAuth::with_http_client(
+            "id".to_owned(),
+            "secret".to_owned(),
+            "https://example.com".to_owned(),
+            crate::http::default_client(),
+        );
+        assert_eq!(auth.auth_base_url(), "https://example.com");
+    }
+
+    /// `with_scopes` defaults to an empty list (no `scope` form param), and
+    /// the builder must be chainable after `with_http_client`.
+    #[test]
+    fn with_scopes_builder_sets_scopes() {
+        let auth = AllegroAuth::with_base_url(
+            "id".to_owned(),
+            "secret".to_owned(),
+            "https://example.com".to_owned(),
+        );
+        // Default: empty — the token request body stays byte-identical to
+        // the scope-less flow (asserted end-to-end in the integration tests).
+        let auth = auth.with_scopes(vec!["allegro:api:read".to_owned()]);
+        let _ = auth; // construction must not panic
     }
 
     /// The `Debug` output must expose `client_id` and `auth_base_url` in

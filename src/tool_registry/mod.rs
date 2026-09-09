@@ -20,6 +20,10 @@ pub struct ToolDef {
     pub method: String,
     /// Raw path string: "/sale/offers/{offerId}"
     pub path: String,
+    /// Versioned media type extracted from OpenAPI `content` keys, e.g.
+    /// `application/vnd.allegro.public.v1+json`; `None` → the dispatcher's
+    /// default `Accept` (see [`crate::http::DEFAULT_ACCEPT`]).
+    pub accept_media_type: Option<String>,
 }
 
 /// Errors from the tool registry.
