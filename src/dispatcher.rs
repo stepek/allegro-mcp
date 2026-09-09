@@ -287,4 +287,143 @@ mod tests {
             "expected 'unsupported HTTP method' error, got: {err}"
         );
     }
+
+    // ── percent_encode ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_percent_encode_unreserved_chars_unchanged() {
+        // RFC 3986 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~"
+        let input = "abcXYZ0129-._~";
+        assert_eq!(percent_encode(input), input);
+    }
+
+    #[test]
+    fn test_percent_encode_space_becomes_percent_20() {
+        assert_eq!(percent_encode("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn test_percent_encode_slash_becomes_percent_2f() {
+        assert_eq!(percent_encode("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn test_percent_encode_empty_string() {
+        assert_eq!(percent_encode(""), "");
+    }
+
+    #[test]
+    fn test_percent_encode_special_chars() {
+        // Curly braces, colons, and at-signs must be encoded.
+        let encoded = percent_encode("{id}");
+        assert_eq!(encoded, "%7Bid%7D");
+    }
+
+    // ── substitute_path_params with non-string JSON values ───────────────────
+
+    #[test]
+    fn test_substitute_path_params_numeric_value() {
+        // Non-string JSON values (numbers) must be stringified and encoded.
+        let mut args = serde_json::Map::new();
+        args.insert("offerId".to_string(), serde_json::Value::Number(42.into()));
+        let (path, consumed) = substitute_path_params("/sale/offers/{offerId}", &args);
+        assert_eq!(path, "/sale/offers/42");
+        assert_eq!(consumed, vec!["offerId".to_string()]);
+    }
+
+    #[test]
+    fn test_substitute_path_params_value_with_special_chars_is_encoded() {
+        // Values containing URL-unsafe characters must be percent-encoded.
+        let args = map(&[("q", "hello world")]);
+        let (path, consumed) = substitute_path_params("/search/{q}", &args);
+        assert_eq!(path, "/search/hello%20world");
+        assert_eq!(consumed, vec!["q".to_string()]);
+    }
+
+    // ── truncate_body exact boundary ─────────────────────────────────────────
+
+    #[test]
+    fn test_truncate_body_exactly_at_100kb_is_not_truncated() {
+        // A body of exactly MAX_BODY_BYTES bytes must be returned unchanged.
+        let body = "x".repeat(MAX_BODY_BYTES);
+        let result = truncate_body(body.clone());
+        assert_eq!(result, body, "body at exactly 100 KB must not be truncated");
+    }
+
+    // ── dispatch: auth failure returns Err with "auth error" prefix ──────────
+    //
+    // NOTE: `dispatch` hardcodes the Allegro API base URL via `allegro_api_base`,
+    // so it is not possible to intercept the API-level HTTP calls with wiremock
+    // in unit tests. The tests below cover the auth-failure path (which fires
+    // before any API call) and the invalid-method path. Full end-to-end HTTP
+    // routing (GET query params, POST body, 4xx/5xx responses) is covered by
+    // the integration tests in `tests/mcp_server_integration.rs`.
+
+    #[tokio::test]
+    async fn test_dispatch_auth_failure_returns_auth_error() {
+        // Mock the token endpoint to return a 500, causing auth to fail.
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+        let http = reqwest::Client::new();
+        let tool_def = crate::tool_registry::ToolDef {
+            id: "allegro_get_offers".to_string(),
+            name: "allegro_get_offers".to_string(),
+            description: "List offers".to_string(),
+            input_schema: serde_json::json!({}),
+            method: "get".to_string(),
+            path: "/sale/offers".to_string(),
+        };
+
+        let result = dispatch(&auth, &http, false, &tool_def, serde_json::Map::new()).await;
+        let err = result.expect_err("auth failure must return Err");
+        assert!(
+            err.contains("auth error"),
+            "error must start with 'auth error', got: {err}"
+        );
+    }
+
+    // ── dispatch: sandbox flag — auth is called before API URL is used ────────
+
+    #[tokio::test]
+    async fn test_dispatch_sandbox_auth_failure_returns_auth_error() {
+        // Even with sandbox=true, auth failure must surface as "auth error".
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+        let http = reqwest::Client::new();
+        let tool_def = crate::tool_registry::ToolDef {
+            id: "allegro_get_offers".to_string(),
+            name: "allegro_get_offers".to_string(),
+            description: "List offers".to_string(),
+            input_schema: serde_json::json!({}),
+            method: "get".to_string(),
+            path: "/sale/offers".to_string(),
+        };
+
+        let result = dispatch(&auth, &http, true, &tool_def, serde_json::Map::new()).await;
+        let err = result.expect_err("auth failure must return Err");
+        assert!(
+            err.contains("auth error"),
+            "sandbox dispatch auth failure must return 'auth error', got: {err}"
+        );
+    }
 }

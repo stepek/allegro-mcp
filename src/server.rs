@@ -174,4 +174,143 @@ mod tests {
         assert!(tool.input_schema.contains_key("properties"));
         assert!(!tool.input_schema.is_empty());
     }
+
+    // ── Additional method coverage ─────────────────────────────────────────────
+
+    #[test]
+    fn test_tool_def_to_rmcp_put_no_read_only_hint() {
+        let def = make_tool_def("put");
+        let tool = tool_def_to_rmcp(&def);
+        assert_eq!(
+            tool.annotations.unwrap().read_only_hint,
+            Some(false),
+            "PUT must not be read-only"
+        );
+    }
+
+    #[test]
+    fn test_tool_def_to_rmcp_patch_no_read_only_hint() {
+        let def = make_tool_def("patch");
+        let tool = tool_def_to_rmcp(&def);
+        assert_eq!(
+            tool.annotations.unwrap().read_only_hint,
+            Some(false),
+            "PATCH must not be read-only"
+        );
+    }
+
+    // ── input_schema with non-object value falls back to empty map ────────────
+
+    #[test]
+    fn test_tool_def_to_rmcp_non_object_input_schema_falls_back_to_empty() {
+        // If input_schema is not a JSON object (e.g. null), tool_def_to_rmcp
+        // must fall back to an empty map rather than panicking.
+        let def = ToolDef {
+            id: "allegro_null_schema".to_string(),
+            name: "allegro_null_schema".to_string(),
+            description: "Tool with null schema".to_string(),
+            input_schema: serde_json::Value::Null,
+            method: "get".to_string(),
+            path: "/test".to_string(),
+        };
+        let tool = tool_def_to_rmcp(&def);
+        // Must not panic; input_schema must be an empty map.
+        assert!(
+            tool.input_schema.is_empty(),
+            "non-object input_schema must fall back to empty map"
+        );
+    }
+
+    // ── get_info returns expected server name and capabilities ─────────────────
+
+    #[test]
+    fn test_get_info_returns_allegro_mcp_server_name() {
+        use rmcp::ServerHandler;
+
+        let registry = crate::tool_registry::ToolRegistry::from_openapi(
+            &serde_yaml::from_str::<openapiv3::OpenAPI>(
+                "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let auth = crate::auth::AllegroAuth::new("id".to_string(), "secret".to_string(), false);
+        let server = AllegroServer::new(registry, auth, false);
+
+        let info = server.get_info();
+        // The server info must identify itself as "allegro-mcp".
+        assert_eq!(
+            info.server_info.name.as_str(),
+            "allegro-mcp",
+            "server name must be 'allegro-mcp'"
+        );
+    }
+
+    #[test]
+    fn test_get_info_has_tools_capability() {
+        use rmcp::ServerHandler;
+
+        let registry = crate::tool_registry::ToolRegistry::from_openapi(
+            &serde_yaml::from_str::<openapiv3::OpenAPI>(
+                "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let auth = crate::auth::AllegroAuth::new("id".to_string(), "secret".to_string(), false);
+        let server = AllegroServer::new(registry, auth, false);
+
+        let info = server.get_info();
+        // The server must advertise tools capability.
+        assert!(
+            info.capabilities.tools.is_some(),
+            "server must advertise tools capability"
+        );
+    }
+
+    #[test]
+    fn test_get_info_instructions_mention_allegro() {
+        use rmcp::ServerHandler;
+
+        let registry = crate::tool_registry::ToolRegistry::from_openapi(
+            &serde_yaml::from_str::<openapiv3::OpenAPI>(
+                "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let auth = crate::auth::AllegroAuth::new("id".to_string(), "secret".to_string(), false);
+        let server = AllegroServer::new(registry, auth, false);
+
+        let info = server.get_info();
+        let instructions = info.instructions.as_deref().unwrap_or("");
+        assert!(
+            instructions.contains("Allegro"),
+            "instructions must mention Allegro, got: {instructions}"
+        );
+    }
+
+    // ── AllegroServer::new sandbox flag ───────────────────────────────────────
+
+    #[test]
+    fn test_allegro_server_new_stores_sandbox_flag() {
+        // We can't directly inspect `sandbox` on AllegroServer (it's private),
+        // but we can verify construction doesn't panic for both values.
+        let make_server = |sandbox: bool| {
+            let registry = crate::tool_registry::ToolRegistry::from_openapi(
+                &serde_yaml::from_str::<openapiv3::OpenAPI>(
+                    "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let auth =
+                crate::auth::AllegroAuth::new("id".to_string(), "secret".to_string(), sandbox);
+            AllegroServer::new(registry, auth, sandbox)
+        };
+
+        // Must not panic for either value.
+        let _prod = make_server(false);
+        let _sandbox = make_server(true);
+    }
 }
