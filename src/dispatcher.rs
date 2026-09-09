@@ -100,10 +100,35 @@ pub async fn dispatch(
     tool_def: &crate::tool_registry::ToolDef,
     arguments: serde_json::Map<String, Value>,
 ) -> Result<String, String> {
+    dispatch_with_base(
+        auth,
+        http,
+        allegro_api_base(sandbox),
+        tool_def,
+        arguments,
+    )
+    .await
+}
+
+/// Like [`dispatch`] but accepts an explicit API base URL instead of deriving
+/// it from the `sandbox` flag.
+///
+/// Exposed as `pub` (with `#[doc(hidden)]`) so that integration tests in
+/// `tests/` — which are compiled as a separate crate — can inject a wiremock
+/// base URL without changing the production public API. Production callers
+/// should use [`dispatch`] instead.
+#[doc(hidden)]
+pub async fn dispatch_with_base(
+    auth: &crate::auth::AllegroAuth,
+    http: &reqwest::Client,
+    api_base: &str,
+    tool_def: &crate::tool_registry::ToolDef,
+    arguments: serde_json::Map<String, Value>,
+) -> Result<String, String> {
     let token = auth.token().await.map_err(|e| format!("auth error: {e}"))?;
 
     let (path, consumed) = substitute_path_params(&tool_def.path, &arguments);
-    let url = format!("{}{}", allegro_api_base(sandbox), path);
+    let url = format!("{}{}", api_base, path);
 
     let method = reqwest::Method::from_bytes(tool_def.method.to_uppercase().as_bytes())
         .map_err(|_| format!("unsupported HTTP method: {}", tool_def.method))?;

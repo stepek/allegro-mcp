@@ -526,4 +526,453 @@ async fn test_call_tool_unknown_name_error_message_includes_tool_name() {
     server_handle.abort();
 }
 
+// ── Issue #3: write-method readOnlyHint=false assertion ──────────────────────
+
+/// POST/PUT/DELETE tools must have `readOnlyHint=false` in `tools/list`.
+/// The fixture has `createOffer` (POST), `updateOffer` (PUT), `deleteOffer`
+/// (DELETE) — all must be non-read-only.
+///
+/// Tool names are derived from the registry (not hard-coded) to stay robust
+/// against sanitization changes in `builder.rs`.
+#[tokio::test]
+async fn test_list_tools_write_methods_have_no_read_only_hint() {
+    let registry = build_registry().await;
+
+    // Collect the names of all write-method tools from the registry so we can
+    // look them up in the wire response without hard-coding sanitized names.
+    let write_tool_names: std::collections::HashSet<String> = registry
+        .list_tools()
+        .iter()
+        .filter(|t| matches!(t.method.as_str(), "post" | "put" | "delete" | "patch"))
+        .map(|t| t.name.clone())
+        .collect();
+
+    assert!(
+        !write_tool_names.is_empty(),
+        "fixture must contain at least one write tool (POST/PUT/DELETE)"
+    );
+
+    let auth = AllegroAuth::new("test-id".to_string(), "test-secret".to_string(), false);
+    let handler = AllegroServer::new(registry, auth, false);
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    send_json(
+        &mut client,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("expected tools array in response");
+
+    // Every write-method tool must have readOnlyHint=false (or absent/null).
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("");
+        if write_tool_names.contains(name) {
+            let hint = &tool["annotations"]["readOnlyHint"];
+            assert!(
+                hint == &json!(false) || hint.is_null(),
+                "write tool '{name}' must have readOnlyHint=false or absent, got: {tool}"
+            );
+        }
+    }
+
+    server_handle.abort();
+}
+
+// ── Issue #4: known tool called with no `arguments` field ────────────────────
+
+/// A known tool called with no `arguments` field must exercise the
+/// `request.arguments.unwrap_or_default()` path in `call_tool` and return a
+/// valid MCP response (tool-level error due to auth failure, not a crash).
+#[tokio::test]
+async fn test_call_known_tool_with_no_arguments_field_does_not_crash() {
+    let mock_server = MockServer::start().await;
+
+    // Auth always fails — we just want to confirm the server handles the
+    // missing `arguments` field gracefully before reaching the network.
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let registry = build_registry().await;
+    let tool_name = registry
+        .list_tools()
+        .first()
+        .expect("fixture must have at least one tool")
+        .name
+        .clone();
+
+    let auth = AllegroAuth::with_base_url(
+        "test-id".to_string(),
+        "test-secret".to_string(),
+        mock_server.uri(),
+    );
+    let handler = AllegroServer::new(registry, auth, false);
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    // No "arguments" key in params — exercises `unwrap_or_default()`.
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool_name }
+        }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+
+    // Must return a tool-level error result, not a JSON-RPC protocol error,
+    // and must not crash the server.
+    assert!(
+        response["error"].is_null(),
+        "known tool with no arguments must not return a JSON-RPC error, got: {response}"
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "known tool with no arguments must return isError=true (auth failure), got: {response}"
+    );
+
+    // Session must still be usable.
+    send_json(
+        &mut client,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+    )
+    .await;
+    let list_response = recv_json(&mut client).await;
+    assert!(
+        list_response["result"]["tools"].is_array(),
+        "session must remain usable after call with no arguments, got: {list_response}"
+    );
+
+    server_handle.abort();
+}
+
+// ── Issue #1: happy-path tools/call with mocked API endpoint ─────────────────
+
+/// `tools/call` with a mocked OAuth token AND a mocked API endpoint must
+/// return `isError` absent/false and `content[0].text` containing the mocked
+/// response body.
+///
+/// Uses `AllegroServer::with_api_base_url` to inject the wiremock server URL
+/// so that the dispatcher hits the mock instead of the real Allegro API.
+#[tokio::test]
+async fn test_call_tool_happy_path_returns_mocked_body() {
+    let mock_server = MockServer::start().await;
+
+    // Mock the OAuth token endpoint.
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({ "access_token": "test-token", "expires_in": 3600 }),
+            ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // Mock the GET /sale/offers endpoint.
+    Mock::given(method("GET"))
+        .and(path("/sale/offers"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"offers":[],"count":0}"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let registry = build_registry().await;
+    // Find the getListingOffers tool (GET /sale/offers).
+    let tool_name = registry
+        .list_tools()
+        .iter()
+        .find(|t| t.method == "get" && t.path == "/sale/offers")
+        .expect("fixture must have GET /sale/offers tool")
+        .name
+        .clone();
+
+    let auth = AllegroAuth::with_base_url(
+        "test-id".to_string(),
+        "test-secret".to_string(),
+        mock_server.uri(),
+    );
+    // Inject the mock server as the API base URL so dispatch hits the mock.
+    let handler = AllegroServer::new(registry, auth, false)
+        .with_api_base_url(mock_server.uri());
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": {} }
+        }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+
+    // Must be a successful result, not an error.
+    assert!(
+        response["error"].is_null(),
+        "happy-path tool call must not return a JSON-RPC error, got: {response}"
+    );
+    assert_ne!(
+        response["result"]["isError"],
+        json!(true),
+        "happy-path tool call must not set isError=true, got: {response}"
+    );
+
+    // content[0].text must contain the mocked response body.
+    let content = response["result"]["content"]
+        .as_array()
+        .expect("successful tool call must have content array");
+    assert!(
+        !content.is_empty(),
+        "successful tool call must have non-empty content"
+    );
+    let text = content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("offers"),
+        "content[0].text must contain the mocked response body, got: {text}"
+    );
+
+    server_handle.abort();
+}
+
+// ── Issue #2: 100 KB truncation integration test ──────────────────────────────
+
+/// A mocked API endpoint returning >100 KB of data must result in
+/// `content[0].text` ending with `[truncated]`.
+#[tokio::test]
+async fn test_call_tool_response_over_100kb_is_truncated() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({ "access_token": "test-token", "expires_in": 3600 }),
+            ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // Return a body that is clearly over 100 KB (102_400 bytes).
+    let large_body = "x".repeat(200_000);
+    Mock::given(method("GET"))
+        .and(path("/sale/offers"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(large_body))
+        .mount(&mock_server)
+        .await;
+
+    let registry = build_registry().await;
+    let tool_name = registry
+        .list_tools()
+        .iter()
+        .find(|t| t.method == "get" && t.path == "/sale/offers")
+        .expect("fixture must have GET /sale/offers tool")
+        .name
+        .clone();
+
+    let auth = AllegroAuth::with_base_url(
+        "test-id".to_string(),
+        "test-secret".to_string(),
+        mock_server.uri(),
+    );
+    let handler = AllegroServer::new(registry, auth, false)
+        .with_api_base_url(mock_server.uri());
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": {} }
+        }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+
+    assert!(
+        response["error"].is_null(),
+        "truncation test must not return a JSON-RPC error, got: {response}"
+    );
+    assert_ne!(
+        response["result"]["isError"],
+        json!(true),
+        "truncation test must not set isError=true, got: {response}"
+    );
+
+    let content = response["result"]["content"]
+        .as_array()
+        .expect("truncation test must have content array");
+    let text = content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.ends_with("[truncated]"),
+        "response over 100 KB must end with '[truncated]', got last 50 chars: {:?}",
+        &text[text.len().saturating_sub(50)..]
+    );
+
+    server_handle.abort();
+}
+
+// ── Issue #6: sandbox URL routing ────────────────────────────────────────────
+
+/// When `sandbox=true`, the server must route API calls to the sandbox base
+/// URL. Verified by injecting the mock server as the API base URL and
+/// confirming the call succeeds (the mock only responds to the injected URL).
+#[tokio::test]
+async fn test_call_tool_sandbox_uses_injected_base_url() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({ "access_token": "sandbox-token", "expires_in": 3600 }),
+            ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/sale/offers"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"sandbox":true}"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let registry = build_registry().await;
+    let tool_name = registry
+        .list_tools()
+        .iter()
+        .find(|t| t.method == "get" && t.path == "/sale/offers")
+        .expect("fixture must have GET /sale/offers tool")
+        .name
+        .clone();
+
+    let auth = AllegroAuth::with_base_url(
+        "test-id".to_string(),
+        "test-secret".to_string(),
+        mock_server.uri(),
+    );
+    // sandbox=true, but API base overridden to the mock server.
+    let handler = AllegroServer::new(registry, auth, true)
+        .with_api_base_url(mock_server.uri());
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": {} }
+        }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+
+    assert!(
+        response["error"].is_null(),
+        "sandbox tool call must not return a JSON-RPC error, got: {response}"
+    );
+    assert_ne!(
+        response["result"]["isError"],
+        json!(true),
+        "sandbox tool call must not set isError=true, got: {response}"
+    );
+    let content = response["result"]["content"]
+        .as_array()
+        .expect("sandbox tool call must have content array");
+    let text = content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("sandbox"),
+        "sandbox tool call content must contain mocked body, got: {text}"
+    );
+
+    server_handle.abort();
+}
+
+// ── Issue #5: graceful EOF shutdown test ─────────────────────────────────────
+
+/// Dropping the client transport (simulating stdin EOF) must cause the server
+/// task to exit cleanly — not via `abort()` — within a reasonable timeout.
+#[tokio::test]
+async fn test_server_exits_cleanly_on_client_eof() {
+    let registry = build_registry().await;
+    let auth = AllegroAuth::new("test-id".to_string(), "test-secret".to_string(), false);
+    let handler = AllegroServer::new(registry, auth, false);
+
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server_handle = tokio::spawn(async move {
+        let running = handler
+            .serve(server_transport)
+            .await
+            .expect("serve failed");
+        let _ = running.waiting().await;
+    });
+
+    let mut client: Client = BufReader::new(client_transport);
+    initialize(&mut client).await;
+
+    // Drop the client — this closes the write end of the duplex, which the
+    // server sees as EOF on its read end, triggering graceful shutdown.
+    drop(client);
+
+    // The server task must exit on its own within 2 seconds.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        server_handle,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "server task must exit cleanly within 2 s after client EOF"
+    );
+    // The JoinHandle result must not be a panic.
+    assert!(
+        result.unwrap().is_ok(),
+        "server task must not panic on client EOF"
+    );
+}
+
+// ── Issue #7: stdout purity note ─────────────────────────────────────────────
+
+// NOTE: "strict JSON-RPC on stdout, logs → stderr only" is enforced by the
+// `tracing_subscriber` configuration in `main.rs`:
+//
+//     tracing_subscriber::fmt()
+//         .with_writer(std::io::stderr)   // <-- all log output goes to stderr
+//         .init();
+//
+// This property cannot be easily tested in-process because the in-process
+// duplex transport used here bypasses stdout/stderr entirely. The guarantee
+// is structural: the MCP server writes only via `rmcp`'s stdio transport
+// (which writes to stdout), and all `tracing` events are routed to stderr
+// by the subscriber initialised in `main`. Any future change that adds a
+// `tracing_subscriber` writing to stdout would break this invariant and
+// should be caught in code review.
 

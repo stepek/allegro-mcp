@@ -14,6 +14,9 @@ pub struct AllegroServer {
     auth: Arc<crate::auth::AllegroAuth>,
     http: reqwest::Client,
     sandbox: bool,
+    /// Override for the Allegro API base URL. `None` means use the default
+    /// derived from `sandbox`. Set via [`Self::with_api_base_url`] in tests.
+    api_base_url: Option<String>,
 }
 
 impl AllegroServer {
@@ -29,7 +32,20 @@ impl AllegroServer {
             auth: Arc::new(auth),
             http: reqwest::Client::new(),
             sandbox,
+            api_base_url: None,
         }
+    }
+
+    /// Override the Allegro API base URL used for dispatching tool calls.
+    ///
+    /// Intended for testing only — allows injecting a wiremock server URL so
+    /// that integration tests can intercept API-level HTTP calls without real
+    /// network access. Production callers should use [`Self::new`].
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_api_base_url(mut self, api_base_url: String) -> Self {
+        self.api_base_url = Some(api_base_url);
+        self
     }
 }
 
@@ -97,9 +113,27 @@ impl rmcp::ServerHandler for AllegroServer {
 
         let arguments = request.arguments.unwrap_or_default();
 
-        match crate::dispatcher::dispatch(&self.auth, &self.http, self.sandbox, tool_def, arguments)
+        let dispatch_result = if let Some(ref base) = self.api_base_url {
+            crate::dispatcher::dispatch_with_base(
+                &self.auth,
+                &self.http,
+                base,
+                tool_def,
+                arguments,
+            )
             .await
-        {
+        } else {
+            crate::dispatcher::dispatch(
+                &self.auth,
+                &self.http,
+                self.sandbox,
+                tool_def,
+                arguments,
+            )
+            .await
+        };
+
+        match dispatch_result {
             Ok(body) => Ok(rmcp::model::CallToolResponse::Complete(
                 rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(body)]),
             )),
