@@ -56,6 +56,18 @@ impl ToolRegistry {
         self.tools.iter().find(|t| t.id == id)
     }
 
+    /// Look up a tool by its `name` field (as exposed to MCP clients via
+    /// `tools/list` and referenced in `tools/call` requests).
+    ///
+    /// Note: `builder.rs` currently sets `ToolDef::name == ToolDef::id` for
+    /// every tool, so this and [`Self::get_tool`] are equivalent today. This
+    /// method exists so callers that are logically looking up "the tool the
+    /// MCP client asked for by name" (e.g. `AllegroServer::call_tool`) don't
+    /// depend on that invariant holding forever.
+    pub fn get_tool_by_name(&self, name: &str) -> Option<&ToolDef> {
+        self.tools.iter().find(|t| t.name == name)
+    }
+
     /// Filter tools by a predicate (for Phase 10 filtering hooks).
     #[allow(dead_code)]
     pub fn filter_tools<F>(&self, predicate: F) -> Vec<&ToolDef>

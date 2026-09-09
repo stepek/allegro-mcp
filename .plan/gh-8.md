@@ -189,13 +189,13 @@ fn tool_def_to_rmcp(def: &crate::tool_registry::ToolDef) -> rmcp::model::Tool
 - Build tool:
   ```rust
   rmcp::model::Tool::new(
-      def.name.clone(),       // Cow<'static, str> — clone as owned String, coerced
+      def.name.clone(),
       def.description.clone(),
       input_schema,
   )
   .with_annotations(annotations)
   ```
-  Note: `Tool::new` takes `N: Into<Cow<'static, str>>` — `String` satisfies this.
+  Note: `Tool::new` takes generic parameters `N: Into<Cow<'static, str>>` for name and description — `String` satisfies this via the blanket `impl Into<Cow<'static, str>> for String`.
 
 **Step 2.3 — Implement `ServerHandler` for `AllegroServer`**
 
@@ -252,9 +252,11 @@ async fn call_tool(
     let tool_def = match self.registry.get_tool(&request.name) {
         Some(t) => t,
         None => {
-            return Err(rmcp::ErrorData::method_not_found::<
-                rmcp::model::CallToolRequestMethod,
-            >());
+            return Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                format!("unknown tool: {}", request.name),
+                None,
+            ));
         }
     };
 
@@ -361,21 +363,17 @@ async fn run_mcp_server(sandbox: bool, source: schema::SchemaSource) -> Result<(
     tracing::info!("MCP server ready");
 
     // 6. Block until stdin EOF (client disconnect) or cancellation
-    running.waiting().await
-        .map_err(|e| anyhow::anyhow!("MCP server task error: {e}"))?;
+    // waiting() returns Result<QuitReason, JoinError>; all quit reasons are acceptable exits
+    let _ = running.waiting().await;
 
     tracing::info!("MCP server shut down");
     Ok(())
 }
 ```
 
-**Step 3.5 — Add required imports**
+**Step 3.5 — No extra imports needed**
 
-Add to the top of `main.rs`:
-```rust
-use rmcp::ServiceExt as _;   // needed if using .serve() extension method
-```
-Or, since `serve_server` is a free function re-exported from `rmcp`, just ensure `rmcp` is in scope (it already is via `Cargo.toml`).
+`serve_server` is a free function re-exported from `rmcp` and is already in scope via `Cargo.toml`. No additional `use` statements are required.
 
 **Step 3.6 — Update startup log message**
 
@@ -423,9 +421,11 @@ Note: `auth` was previously not exposed. It must be made public for integration 
 
 **`tests/mcp_server_integration.rs`** (new file):
 - `test_list_tools_returns_registry_tools` — build `AllegroServer` from a minimal OpenAPI doc, call `list_tools(None, ...)` directly, assert the returned `Vec<Tool>` length matches the registry.
-- `test_call_tool_unknown_name_returns_method_not_found` — call `call_tool` with a name not in the registry, assert `Err(McpError)` with `ErrorCode::METHOD_NOT_FOUND`.
-- `test_call_tool_error_does_not_crash_session` — mock HTTP 500 response (wiremock), call `call_tool`, assert `Ok(CallToolResponse::Complete(result))` with `is_error == Some(true)`.
-- `test_call_tool_success_returns_text_content` — mock HTTP 200 with JSON body, call `call_tool`, assert `Ok(CallToolResponse::Complete(result))` with `is_error != Some(true)` and content contains the JSON body.
+- `test_call_tool_unknown_name_returns_method_not_found` — call `call_tool` with a name not in the registry, assert `Err(ErrorData)` with `ErrorCode::METHOD_NOT_FOUND`.
+- `test_call_tool_error_does_not_crash_session` — use wiremock to mock both the token endpoint (`POST /auth/oauth/token` → 200 with fake token) and the API endpoint (`GET /...` → 500). Construct `AllegroAuth::new("id", "secret", false)` pointing at the wiremock server. Call `call_tool`, assert `Ok(CallToolResponse::Complete(result))` with `is_error == Some(true)`.
+- `test_call_tool_success_returns_text_content` — use wiremock to mock token endpoint and API endpoint (`GET /...` → 200 with JSON body). Call `call_tool`, assert `Ok(CallToolResponse::Complete(result))` with `is_error != Some(true)` and content contains the JSON body.
+
+**Auth injection for integration tests**: Use `AllegroAuth::new(client_id, client_secret, sandbox)` with a wiremock server URL override. Check if `AllegroAuth` supports a custom auth URL (it does via `new()` which takes `sandbox: bool` and derives the URL). For tests, either: (a) use a real `AllegroAuth::new("test-id", "test-secret", false)` and mock the token endpoint at the production URL via wiremock, or (b) add a `#[cfg(test)]` constructor `AllegroAuth::with_base_url(client_id, client_secret, base_url)` that allows injecting a custom auth host. Prefer option (b) for isolation.
 
 ---
 
@@ -505,14 +505,5 @@ Note: `auth` was previously not exposed. It must be made public for integration 
 **Handling**: From source inspection, `Implementation` has `name: String` and `version: String`. Use `Implementation { name: "allegro-mcp".to_string(), version: env!("CARGO_PKG_VERSION").to_string() }` for direct construction, or check if a constructor exists. If the struct is `#[non_exhaustive]`, use `..Default::default()` for any additional fields.
 
 ### 16. `ListToolsResult` constructor API
-**Scenario**: The `paginated_result!` macro may not generate a `with_all_items` constructor.
-**Handling**: If `with_all_items` does not exist, construct directly:
-```rust
-rmcp::model::ListToolsResult {
-    tools,
-    next_cursor: None,
-    result_type: None,
-    meta: None,
-}
-```
-The implementer must verify the exact field names by checking the macro expansion or the generated struct. The `paginated_result!` macro in rmcp generates `tools: Vec<Tool>` and `next_cursor: Option<String>` as the primary fields.
+**Scenario**: The `paginated_result!` macro generates additional fields in rmcp 3.2.0 (`ttl_ms`, `cache_scope`) beyond `tools` and `next_cursor`.
+**Handling**: Use `ListToolsResult::with_all_items(tools)` exclusively — this constructor is confirmed to exist in rmcp 3.2.0 and handles all generated fields correctly. Do NOT use a struct literal fallback, as it would fail to compile due to missing `ttl_ms` and `cache_scope` fields.
