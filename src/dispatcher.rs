@@ -106,7 +106,7 @@ pub async fn dispatch(
     let url = format!("{}{}", allegro_api_base(sandbox), path);
 
     let method = reqwest::Method::from_bytes(tool_def.method.to_uppercase().as_bytes())
-        .unwrap_or(reqwest::Method::GET);
+        .map_err(|_| format!("unsupported HTTP method: {}", tool_def.method))?;
 
     let mut remaining = arguments;
     for name in &consumed {
@@ -132,6 +132,12 @@ pub async fn dispatch(
             .collect();
         builder = builder.query(&pairs);
     } else if let Some(body) = remaining.remove("body") {
+        // CONVENTION: "body" key is reserved for requestBody content; set by
+        // schema_builder.rs. `schema_builder::build_input_schema` only adds a
+        // top-level "body" property to a tool's input_schema when the OpenAPI
+        // operation declares a `requestBody`, so a non-GET/HEAD tool call
+        // arriving with a "body" argument is always the intended request
+        // payload, never an unrelated query/form field with the same name.
         builder = builder.json(&body);
     } else {
         builder = builder.json(&remaining);
@@ -240,5 +246,45 @@ mod tests {
     #[test]
     fn test_allegro_api_base_sandbox() {
         assert_eq!(allegro_api_base(true), "https://api.allegrosandbox.pl");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_unsupported_method_returns_error() {
+        // Auth must succeed first (dispatch fetches the token before parsing
+        // the method), so mock a valid token response.
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "access_token": "tok", "expires_in": 3600 }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+        let http = reqwest::Client::new();
+        let tool_def = crate::tool_registry::ToolDef {
+            id: "allegro_bad_method".to_string(),
+            name: "allegro_bad_method".to_string(),
+            description: "d".to_string(),
+            input_schema: serde_json::json!({}),
+            // A space is not a valid HTTP token character, so this is
+            // guaranteed to be rejected by `Method::from_bytes`.
+            method: "get post".to_string(),
+            path: "/x".to_string(),
+        };
+
+        let result = dispatch(&auth, &http, false, &tool_def, serde_json::Map::new()).await;
+        let err = result.expect_err("invalid method must be rejected");
+        assert!(
+            err.contains("unsupported HTTP method"),
+            "expected 'unsupported HTTP method' error, got: {err}"
+        );
     }
 }

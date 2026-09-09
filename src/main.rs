@@ -154,7 +154,9 @@ async fn run_mcp_server(sandbox: bool, source: schema::SchemaSource) -> Result<(
 
     tracing::info!("MCP server ready");
 
-    let _ = running.waiting().await;
+    if let Err(e) = running.waiting().await {
+        tracing::warn!("MCP server exited with error: {e}");
+    }
 
     tracing::info!("MCP server shut down");
     Ok(())

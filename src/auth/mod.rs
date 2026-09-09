@@ -133,11 +133,14 @@ impl AllegroAuth {
         Self::with_base_url(client_id, client_secret, auth_base_url)
     }
 
-    /// Constructs an [`AllegroAuth`] with an explicit auth base URL.
+    /// Test-only constructor for injecting a custom auth base URL.
     ///
-    /// Intended for integration tests that need to point the token endpoint
-    /// at a mock server; production callers should use [`Self::new`] or
-    /// [`Self::from_env`] instead.
+    /// Must remain `pub` (not `pub(crate)`) because integration tests under
+    /// `tests/` are compiled as a separate crate and can only see `pub`
+    /// items; `#[doc(hidden)]` keeps it out of the public docs so it isn't
+    /// mistaken for a supported production API. Production callers should
+    /// use [`Self::new`] or [`Self::from_env`] instead.
+    #[doc(hidden)]
     pub fn with_base_url(client_id: String, client_secret: String, auth_base_url: String) -> Self {
         info!(auth_base_url, "AllegroAuth initialised");
         Self {

@@ -83,7 +83,11 @@ impl rmcp::ServerHandler for AllegroServer {
         request: rmcp::model::CallToolRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        let Some(tool_def) = self.registry.get_tool(request.name.as_ref()) else {
+        // MCP `tools/call` requests reference the tool by its `name` field,
+        // not its `id` — look it up accordingly. (Today `ToolDef::id ==
+        // ToolDef::name`, an invariant enforced by builder.rs, but
+        // `get_tool_by_name` doesn't depend on that holding forever.)
+        let Some(tool_def) = self.registry.get_tool_by_name(request.name.as_ref()) else {
             return Err(rmcp::ErrorData::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 format!("unknown tool: {}", request.name),
