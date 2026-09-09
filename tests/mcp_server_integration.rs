@@ -568,14 +568,15 @@ async fn test_list_tools_write_methods_have_no_read_only_hint() {
         .as_array()
         .expect("expected tools array in response");
 
-    // Every write-method tool must have readOnlyHint=false (or absent/null).
+    // Every write-method tool must have readOnlyHint explicitly set to false.
     for tool in tools {
         let name = tool["name"].as_str().unwrap_or("");
         if write_tool_names.contains(name) {
             let hint = &tool["annotations"]["readOnlyHint"];
-            assert!(
-                hint == &json!(false) || hint.is_null(),
-                "write tool '{name}' must have readOnlyHint=false or absent, got: {tool}"
+            assert_eq!(
+                hint,
+                &json!(false),
+                "write tool '{name}' must have readOnlyHint=false (not absent/null), got: {tool}"
             );
         }
     }
@@ -834,13 +835,14 @@ async fn test_call_tool_response_over_100kb_is_truncated() {
     server_handle.abort();
 }
 
-// ── Issue #6: sandbox URL routing ────────────────────────────────────────────
+// ── Issue #6: API base URL override ──────────────────────────────────────────
 
-/// When `sandbox=true`, the server must route API calls to the sandbox base
-/// URL. Verified by injecting the mock server as the API base URL and
-/// confirming the call succeeds (the mock only responds to the injected URL).
+/// `AllegroServer::with_api_base_url` must route all API calls to the
+/// injected URL regardless of the `sandbox` flag. Verified by injecting the
+/// wiremock server URL and confirming the call reaches the mock and returns
+/// the mocked body.
 #[tokio::test]
-async fn test_call_tool_sandbox_uses_injected_base_url() {
+async fn test_call_tool_with_api_base_url_override_succeeds() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -875,7 +877,8 @@ async fn test_call_tool_sandbox_uses_injected_base_url() {
         "test-secret".to_string(),
         mock_server.uri(),
     );
-    // sandbox=true, but API base overridden to the mock server.
+    // sandbox=true, API base overridden to the mock server — the override
+    // must take precedence over the sandbox flag's default URL.
     let handler = AllegroServer::new(registry, auth, true)
         .with_api_base_url(mock_server.uri());
 
@@ -896,20 +899,122 @@ async fn test_call_tool_sandbox_uses_injected_base_url() {
 
     assert!(
         response["error"].is_null(),
-        "sandbox tool call must not return a JSON-RPC error, got: {response}"
+        "tool call with overridden base URL must not return a JSON-RPC error, got: {response}"
     );
     assert_ne!(
         response["result"]["isError"],
         json!(true),
-        "sandbox tool call must not set isError=true, got: {response}"
+        "tool call with overridden base URL must not set isError=true, got: {response}"
     );
     let content = response["result"]["content"]
         .as_array()
-        .expect("sandbox tool call must have content array");
+        .expect("tool call with overridden base URL must have content array");
     let text = content[0]["text"].as_str().unwrap_or("");
     assert!(
         text.contains("sandbox"),
-        "sandbox tool call content must contain mocked body, got: {text}"
+        "tool call with overridden base URL must return mocked body, got: {text}"
+    );
+
+    server_handle.abort();
+}
+
+// ── Issue #3 (new): 4xx/5xx API-level error integration test ─────────────────
+
+/// When the Allegro API returns HTTP 404, `tools/call` must surface it as a
+/// tool-level error (`isError=true`) with the HTTP status code in the content
+/// text. The session must remain usable afterwards.
+#[tokio::test]
+async fn test_call_tool_api_4xx_returns_tool_level_error() {
+    let mock_server = MockServer::start().await;
+
+    // Valid token so dispatch proceeds past auth.
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({ "access_token": "test-token", "expires_in": 3600 }),
+            ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // API endpoint returns 404.
+    Mock::given(method("GET"))
+        .and(path("/sale/offers"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_string(r#"{"errors":[{"code":"NotFound","message":"Resource not found"}]}"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let registry = build_registry().await;
+    let tool_name = registry
+        .list_tools()
+        .iter()
+        .find(|t| t.method == "get" && t.path == "/sale/offers")
+        .expect("fixture must have GET /sale/offers tool")
+        .name
+        .clone();
+
+    let auth = AllegroAuth::with_base_url(
+        "test-id".to_string(),
+        "test-secret".to_string(),
+        mock_server.uri(),
+    );
+    let handler = AllegroServer::new(registry, auth, false)
+        .with_api_base_url(mock_server.uri());
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": {} }
+        }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+
+    // Must be a tool-level error, not a JSON-RPC protocol error.
+    assert!(
+        response["error"].is_null(),
+        "API 404 must not produce a JSON-RPC error, got: {response}"
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "API 404 must set isError=true, got: {response}"
+    );
+
+    // The error text must mention the HTTP status code.
+    let content = response["result"]["content"]
+        .as_array()
+        .expect("API 404 response must have content array");
+    assert!(
+        !content.is_empty(),
+        "API 404 response must have non-empty content array"
+    );
+    let text = content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("404"),
+        "API 404 error text must contain '404', got: {text}"
+    );
+
+    // Session must remain usable after the tool-level error.
+    send_json(
+        &mut client,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+    )
+    .await;
+    let list_response = recv_json(&mut client).await;
+    assert!(
+        list_response["result"]["tools"].is_array(),
+        "session must remain usable after API 404 error, got: {list_response}"
     );
 
     server_handle.abort();
@@ -962,7 +1067,8 @@ async fn test_server_exits_cleanly_on_client_eof() {
 // ── Issue #7: stdout purity note ─────────────────────────────────────────────
 
 // NOTE: "strict JSON-RPC on stdout, logs → stderr only" is enforced by the
-// `tracing_subscriber` configuration in `main.rs`:
+// `tracing_subscriber` configuration in `src/main.rs` (line 86, inside
+// `main()`):
 //
 //     tracing_subscriber::fmt()
 //         .with_writer(std::io::stderr)   // <-- all log output goes to stderr
