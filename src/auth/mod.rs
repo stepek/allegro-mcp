@@ -75,11 +75,13 @@ impl CachedToken {
 ///
 /// # Example
 /// ```no_run
-/// # tokio_test::block_on(async {
+/// # use allegro_mcp::auth::AllegroAuth;
+/// # #[tokio::main]
+/// # async fn main() {
 /// let auth = AllegroAuth::from_env(false).unwrap();
 /// let token = auth.token().await.unwrap();
 /// println!("Bearer {token}");
-/// # });
+/// # }
 /// ```
 pub struct AllegroAuth {
     client_id: String,
@@ -128,6 +130,15 @@ impl AllegroAuth {
         } else {
             "https://allegro.pl".to_owned()
         };
+        Self::with_base_url(client_id, client_secret, auth_base_url)
+    }
+
+    /// Constructs an [`AllegroAuth`] with an explicit auth base URL.
+    ///
+    /// Intended for integration tests that need to point the token endpoint
+    /// at a mock server; production callers should use [`Self::new`] or
+    /// [`Self::from_env`] instead.
+    pub fn with_base_url(client_id: String, client_secret: String, auth_base_url: String) -> Self {
         info!(auth_base_url, "AllegroAuth initialised");
         Self {
             client_id,

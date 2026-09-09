@@ -1,11 +1,9 @@
 //! allegro-mcp — MCP server for the Allegro REST API.
-//!
-//! Phase 4: client_credentials auth with in-memory token cache.
 
-// Not yet wired into the CLI flow (reserved for a future phase's MCP server mode).
-#[allow(dead_code)]
 mod auth;
+mod dispatcher;
 mod schema;
+mod server;
 mod tool_registry;
 
 use anyhow::Result;
@@ -88,7 +86,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!(sandbox = cli.sandbox, "allegro-mcp starting (phase 4 auth)");
+    info!(sandbox = cli.sandbox, "allegro-mcp starting");
 
     let source = if let Some(path) = cli.schema_file {
         schema::SchemaSource::File(path)
@@ -123,10 +121,42 @@ async fn main() -> Result<()> {
             }
         }
         None => {
-            tracing::warn!("No subcommand — MCP server mode not yet implemented");
+            run_mcp_server(cli.sandbox, source).await?;
         }
     }
 
+    Ok(())
+}
+
+/// Runs the MCP server over stdio: builds auth, loads the schema, builds the
+/// tool registry, and serves `tools/list` + `tools/call` until stdin EOF.
+async fn run_mcp_server(sandbox: bool, source: schema::SchemaSource) -> Result<()> {
+    tracing::info!(sandbox, "starting MCP server (stdio transport)");
+
+    let auth = auth::AllegroAuth::from_env(sandbox)
+        .map_err(|e| anyhow::anyhow!("auth init failed: {e}"))?;
+
+    let (api, _raw) = schema::load(&source)
+        .await
+        .map_err(|e| anyhow::anyhow!("schema load failed: {e}"))?;
+    let registry = tool_registry::ToolRegistry::from_openapi(&api)
+        .map_err(|e| anyhow::anyhow!("registry build failed: {e}"))?;
+
+    tracing::info!(tool_count = registry.len(), "tool registry built");
+
+    let handler = server::AllegroServer::new(registry, auth, sandbox);
+
+    let transport = rmcp::transport::io::stdio();
+
+    let running = rmcp::serve_server(handler, transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server init failed: {e}"))?;
+
+    tracing::info!("MCP server ready");
+
+    let _ = running.waiting().await;
+
+    tracing::info!("MCP server shut down");
     Ok(())
 }
 
