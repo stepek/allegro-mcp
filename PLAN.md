@@ -4,7 +4,8 @@ Source docs: [Auth & OAuth](https://developer.allegro.pl/tutorials/uwierzytelnia
 
 ## Distribution decision
 
-**Docker image on GHCR + Claude Code integration (`claude mcp add`) ONLY.**
+**MAIN: long-running HTTP MCP server (Streamable HTTP) in Docker on GHCR — Open WebUI is the primary client.**
+SECONDARY: Claude Code via stdio with the same image (#13).
 No crates.io publish, no cargo-dist binary matrix.
 
 ## Phases
@@ -16,10 +17,11 @@ No crates.io publish, no cargo-dist binary matrix.
 5. **Auth v2: device flow** — polling loop, token-file persistence, auto-refresh on 401
 6. **Auth v3: authorization code + PKCE** (out-of-band code entry)
 7. **User-Agent + config** — middleware, startup validation, sandbox toggle
-8. **MCP wiring** — rmcp server, list-tools / call-tool handlers
+8. **MCP wiring** — rmcp server, list-tools / call-tool handlers (stdio + streamable HTTP transports)
 9. **Resilience** — 429 backoff, Allegro error JSON → tool errors, Trace-Id passthrough
 10. **Scoping & safety** — allow/deny lists, read-only mode, tool-count guard
 11. **Tests** — wiremock-based integration tests per auth flow + engine
-12. **Release** — Docker image on GHCR + Claude Code integration (`claude mcp add`); no crates.io, no binary matrix
+12. **Release (MAIN)** — HTTP MCP server on Docker/GHCR, Open WebUI as primary client
+13. **Release (SUPPLEMENTARY)** — Claude Code stdio integration, same image
 
 Each phase = one GitHub issue with acceptance criteria.
