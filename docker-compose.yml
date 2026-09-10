@@ -1,0 +1,51 @@
+services:
+  allegro-mcp:
+    image: ghcr.io/stepek/allegro-mcp:latest
+    container_name: allegro-mcp
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ALLEGRO_CLIENT_ID: ${ALLEGRO_CLIENT_ID:?set ALLEGRO_CLIENT_ID in .env}
+      ALLEGRO_CLIENT_SECRET: ${ALLEGRO_CLIENT_SECRET:?set ALLEGRO_CLIENT_SECRET in .env}
+      # Optional: reverse-proxy-friendly bearer-token guard on /mcp and
+      # /auth/status. Off by default — see docs/open-webui.md and
+      # SECURITY.md before exposing this port beyond a private network.
+      ALLEGRO_MCP_SERVER_TOKEN: ${ALLEGRO_MCP_SERVER_TOKEN:-}
+      # Comma-separated allow-list for the inbound Host header. Includes
+      # the compose service name so Open WebUI's requests (Host:
+      # allegro-mcp:8080) aren't rejected by the DNS-rebinding guard.
+      ALLEGRO_MCP_ALLOWED_HOSTS: "allegro-mcp,allegro-mcp:8080,localhost,127.0.0.1"
+      PORT: "8080"
+    volumes:
+      # $HOME/.config/allegro-mcp inside the container (see Dockerfile —
+      # runs as root, HOME=/root). Holds an optional allegro-mcp.toml
+      # (config-file discovery, see src/config.rs) and is reserved for a
+      # future on-disk token cache; nothing is written here by default
+      # today.
+      - allegro-mcp-tokens:/root/.config/allegro-mcp
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/allegro-mcp", "healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+  # Uncomment to run Open WebUI alongside allegro-mcp on the same compose
+  # network — see docs/open-webui.md for the "Add Connection" steps once
+  # both containers are up. Adjust the image tag / volume to your existing
+  # Open WebUI deployment if you already run one.
+  # open-webui:
+  #   image: ghcr.io/open-webui/open-webui:main
+  #   container_name: open-webui
+  #   restart: unless-stopped
+  #   ports:
+  #     - "3000:8080"
+  #   volumes:
+  #     - open-webui-data:/app/backend/data
+  #   depends_on:
+  #     - allegro-mcp
+
+volumes:
+  allegro-mcp-tokens:
+  # open-webui-data:

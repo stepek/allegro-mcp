@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod dispatcher;
 mod http;
+mod http_server;
 mod schema;
 mod server;
 mod tool_registry;
@@ -41,6 +42,19 @@ struct Cli {
     #[arg(long, global = true)]
     user_agent: Option<String>,
 
+    /// Use the stdio MCP transport instead of the default Streamable HTTP
+    /// transport. Intended for local development / editor-embedded clients
+    /// (Claude Desktop, etc.) — production deployments use the HTTP transport
+    /// (Open WebUI is the primary client).
+    #[arg(long, default_value_t = false)]
+    stdio: bool,
+
+    /// TCP port for the HTTP transport (ignored when `--stdio` is set).
+    /// Falls back to `$PORT`, then `8080`. The bind address is always
+    /// `0.0.0.0` — this is a container-first deployment, not a flag.
+    #[arg(long, global = true)]
+    port: Option<u16>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -57,6 +71,10 @@ enum Commands {
         #[command(subcommand)]
         action: ToolsAction,
     },
+    /// Internal: HTTP liveness probe used by the Docker HEALTHCHECK
+    /// (distroless images have no shell, so `curl`/`wget` aren't
+    /// available — the binary probes itself instead).
+    Healthcheck,
 }
 
 #[derive(Debug, Subcommand)]
@@ -96,6 +114,10 @@ async fn main() -> Result<()> {
         .with_max_level(verbosity_level(cli.verbose))
         .with_writer(std::io::stderr)
         .init();
+
+    if matches!(cli.command, Some(Commands::Healthcheck)) {
+        return run_healthcheck().await;
+    }
 
     // Re-package CLI flags for the config pipeline (config.rs stays
     // clap-independent). A bare `--sandbox` flag can only express `true`,
@@ -160,8 +182,25 @@ async fn main() -> Result<()> {
                 println!("  ... and {} more", registry.len() - 5);
             }
         }
+        Some(Commands::Healthcheck) => {
+            // Unreachable: handled by the early return above, before config
+            // loading / network setup. Kept as an explicit arm (rather than
+            // a wildcard `_ =>`) so adding a future `Commands` variant here
+            // forces a compile error instead of silently falling through.
+            unreachable!("Commands::Healthcheck is handled by the early return in main()")
+        }
         None => {
-            run_mcp_server(cfg, api_client, schema_client, source).await?;
+            if cli.stdio {
+                run_mcp_server(cfg, api_client, schema_client, source).await?;
+            } else {
+                let port = cli
+                    .port
+                    .or_else(|| std::env::var("PORT").ok().and_then(|v| v.parse().ok()))
+                    .unwrap_or(8080);
+                let handler =
+                    build_allegro_server(&cfg, api_client, &schema_client, &source).await?;
+                http_server::run_http_server(handler, cfg.sandbox, port).await?;
+            }
         }
     }
 
@@ -180,19 +219,18 @@ fn resolve_schema_source(cfg: &config::Config) -> schema::SchemaSource {
     }
 }
 
-/// Runs the MCP server over stdio: builds auth, loads the schema, builds the
-/// tool registry, and serves `tools/list` + `tools/call` until stdin EOF.
-async fn run_mcp_server(
-    cfg: config::Config,
+/// Shared server-build logic for both transports: reads
+/// `ALLEGRO_CLIENT_ID`/`ALLEGRO_CLIENT_SECRET`, builds `AllegroAuth`,
+/// loads the schema, builds the tool registry, and wires up the
+/// `AllegroServer` handler. Transport-specific code (`run_mcp_server`'s
+/// stdio serve loop; `http_server::run_http_server`'s axum router +
+/// eager auth-check banner) picks up from the returned handler.
+async fn build_allegro_server(
+    cfg: &config::Config,
     api_client: reqwest::Client,
-    schema_client: reqwest::Client,
-    source: schema::SchemaSource,
-) -> Result<()> {
-    tracing::info!(
-        sandbox = cfg.sandbox,
-        "starting MCP server (stdio transport)"
-    );
-
+    schema_client: &reqwest::Client,
+    source: &schema::SchemaSource,
+) -> Result<server::AllegroServer> {
     // Client credentials stay in the classic env vars (auth module contract);
     // everything else about the token request (UA, Accept-Language, host,
     // scopes) comes from the config-driven client below.
@@ -209,16 +247,30 @@ async fn run_mcp_server(
     )
     .with_scopes(cfg.scopes.clone());
 
-    let (api, _raw) = schema::load_with_client(&schema_client, &source)
+    let (api, _raw) = schema::load_with_client(schema_client, source)
         .await
         .map_err(|e| anyhow::anyhow!("schema load failed: {e}"))?;
     let registry = tool_registry::ToolRegistry::from_openapi(&api)
         .map_err(|e| anyhow::anyhow!("registry build failed: {e}"))?;
-
     tracing::info!(tool_count = registry.len(), "tool registry built");
 
-    let handler =
-        server::AllegroServer::new(registry, auth, cfg.sandbox).with_http_client(api_client);
+    Ok(server::AllegroServer::new(registry, auth, cfg.sandbox).with_http_client(api_client))
+}
+
+/// Runs the MCP server over stdio: builds auth, loads the schema, builds the
+/// tool registry, and serves `tools/list` + `tools/call` until stdin EOF.
+async fn run_mcp_server(
+    cfg: config::Config,
+    api_client: reqwest::Client,
+    schema_client: reqwest::Client,
+    source: schema::SchemaSource,
+) -> Result<()> {
+    tracing::info!(
+        sandbox = cfg.sandbox,
+        "starting MCP server (stdio transport)"
+    );
+
+    let handler = build_allegro_server(&cfg, api_client, &schema_client, &source).await?;
 
     let transport = rmcp::transport::io::stdio();
 
@@ -236,9 +288,58 @@ async fn run_mcp_server(
     Ok(())
 }
 
+/// Docker `HEALTHCHECK` probe: `GET http://127.0.0.1:$PORT/health` with a
+/// short timeout. Reads the same `$PORT` (default 8080) the HTTP server
+/// binds to. Exits non-zero (via `anyhow::Error`) on any failure — timeout,
+/// connection refused, or non-2xx status — which Docker treats as unhealthy.
+async fn run_healthcheck() -> Result<()> {
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let url = format!("http://127.0.0.1:{port}/health");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("healthcheck failed: HTTP {}", resp.status());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::verbosity_level;
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn stdio_flag_defaults_to_false() {
+        let cli = Cli::parse_from(["allegro-mcp"]);
+        assert!(!cli.stdio);
+    }
+
+    #[test]
+    fn stdio_flag_parses() {
+        let cli = Cli::parse_from(["allegro-mcp", "--stdio"]);
+        assert!(cli.stdio);
+    }
+
+    #[test]
+    fn port_flag_parses() {
+        let cli = Cli::parse_from(["allegro-mcp", "--port", "9090"]);
+        assert_eq!(cli.port, Some(9090));
+    }
+
+    #[test]
+    fn port_flag_defaults_to_none() {
+        let cli = Cli::parse_from(["allegro-mcp"]);
+        assert_eq!(cli.port, None);
+    }
 
     #[test]
     fn default_verbosity_is_warn() {

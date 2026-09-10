@@ -30,6 +30,44 @@ Every outgoing request carries:
 └────────────────────────────────────────────────────────┘
 ```
 
+## Deployment: HTTP MCP server (Docker)
+
+Starting with this release, `allegro-mcp` defaults to serving MCP over
+**Streamable HTTP** (`POST/GET/DELETE /mcp`) instead of stdio — built for
+long-running deployments with **Open WebUI** as the primary client. The
+stdio transport (Claude Desktop, other local/editor MCP clients) is still
+available via `--stdio`.
+
+```bash
+docker run --rm \
+  -e ALLEGRO_CLIENT_ID=... \
+  -e ALLEGRO_CLIENT_SECRET=... \
+  -p 8080:8080 \
+  ghcr.io/stepek/allegro-mcp:latest
+```
+
+Or via `docker-compose.yml` (see the file in this repo — includes a named
+volume for config/future token-cache persistence and the
+`ALLEGRO_MCP_ALLOWED_HOSTS` setting needed for Docker-network deployments):
+
+```bash
+cp .env.example .env   # fill in ALLEGRO_CLIENT_ID / ALLEGRO_CLIENT_SECRET
+docker compose up -d
+```
+
+See [`docs/open-webui.md`](docs/open-webui.md) for wiring this up as an
+Open WebUI External Tool Server, and [`SECURITY.md`](SECURITY.md) before
+exposing the port beyond a private network.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `PORT` | HTTP listen port | `8080` |
+| `ALLEGRO_MCP_SERVER_TOKEN` | Optional static bearer-token guard on `/mcp` and `/auth/status` | unset (disabled) |
+| `ALLEGRO_MCP_ALLOWED_HOSTS` | Comma-separated `Host` header allow-list (DNS-rebinding guard); `*` disables it | `localhost,127.0.0.1,::1` |
+
+`GET /health` (unauthenticated) and `GET /auth/status` (admin visibility
+into the Allegro token cache) are also served alongside `/mcp`.
+
 ## Key design decisions
 
 | # | Decision | Why |
