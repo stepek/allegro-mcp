@@ -57,6 +57,9 @@ sha2            = "0.10.8"
 # Config file parsing (allegro-mcp.toml)
 toml            = "1"
 
+# Retry-After HTTP-date parsing (already transitive via hyper — promoted)
+httpdate        = "1.0"
+
 [dev-dependencies]
 tempfile        = "3.14.0"
 serial_test     = "3.2.0"

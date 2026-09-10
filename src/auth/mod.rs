@@ -87,6 +87,35 @@ pub enum AuthError {
         stored: &'static str,
         current: &'static str,
     },
+
+    /// Token endpoint responded non-2xx (other than 429): carries the parsed
+    /// OAuth `{"error","error_description"}` when the body had one, plus the
+    /// response's `Trace-Id` (Phase 9 — every error report includes it when
+    /// present). A 4xx here is a *definitive* rejection as far as the
+    /// refresh grant is concerned (see [`is_definitive_rejection`]); a 5xx
+    /// is transient.
+    #[error("token endpoint error (HTTP {status}): {error:?} {error_description:?}")]
+    TokenEndpoint {
+        status: u16,
+        error: Option<String>,
+        error_description: Option<String>,
+        trace_id: Option<String>,
+    },
+
+    /// 429 from the token endpoint — NEVER auto-retried (ticket): a
+    /// rate-limited mint means token churn is too high, and hammering the
+    /// endpoint would make it worse. Surfaces the "token churn too high"
+    /// actionable error. Transient by classification: it must never trigger
+    /// the stale-store wipe (only [`AuthError::TokenEndpoint`] 4xx can).
+    #[error(
+        "token endpoint rate limit (HTTP 429): token churn too high — not retried \
+         automatically. Reduce request frequency and make sure no other \
+         allegro-mcp instance shares this client_id"
+    )]
+    TokenMintRateLimited {
+        retry_after: Option<std::time::Duration>,
+        trace_id: Option<String>,
+    },
 }
 
 // ── Token response ────────────────────────────────────────────────────────────
@@ -396,8 +425,10 @@ impl AllegroAuth {
             .basic_auth(&self.client_id, Some(&self.client_secret))
             .form(&form)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if !resp.status().is_success() {
+            return Err(read_token_error(resp).await);
+        }
 
         let token_resp: TokenResponse = resp.json().await?;
         debug!(
@@ -487,7 +518,7 @@ impl AllegroAuth {
                         info!("device mode: refresh grant rotated the token pair");
                         return Ok((resp.access_token.clone(), effective));
                     }
-                    Err(AuthError::Http(e)) if is_definitive_rejection(&e) => {
+                    Err(e) if is_definitive_rejection(&e) => {
                         // Stale-store guard: a concurrent `auth device` run
                         // may have rotated the file between our load and
                         // this refresh. Reload once and retry only if the
@@ -512,8 +543,7 @@ impl AllegroAuth {
                                     // possibly still valid — keep the file
                                     // and surface the error instead of
                                     // wiping usable state.
-                                    Err(retry_err) if !matches!(&retry_err, AuthError::Http(h) if is_definitive_rejection(h)) =>
-                                    {
+                                    Err(retry_err) if !is_definitive_rejection(&retry_err) => {
                                         return Err(retry_err);
                                     }
                                     // Definitively rejected too: fall
@@ -575,8 +605,10 @@ impl AllegroAuth {
     ///
     /// A 4xx here is a *definitive* rejection (`invalid_grant`-style — the
     /// token was rotated away, revoked, or expired), surfaced as
-    /// [`AuthError::Http`] so the caller's stale-store guard can inspect
-    /// the status via [`is_definitive_rejection`].
+    /// [`AuthError::TokenEndpoint`] so the caller's stale-store guard can
+    /// inspect the status via [`is_definitive_rejection`]. A 429 surfaces
+    /// as [`AuthError::TokenMintRateLimited`] (never retried, never a
+    /// wipe); 5xx/transport stay transient.
     async fn refresh_grant(&self, refresh_token: &str) -> Result<TokenResponse, AuthError> {
         let url = format!("{}/auth/oauth/token", self.auth_base_url);
         debug!(
@@ -594,8 +626,10 @@ impl AllegroAuth {
             .basic_auth(&self.client_id, Some(&self.client_secret))
             .form(&form)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if !resp.status().is_success() {
+            return Err(read_token_error(resp).await);
+        }
 
         let parsed: TokenResponse = resp.json().await?;
         debug!(
@@ -723,11 +757,45 @@ fn clamp_expires_in(expires_in: u64) -> u64 {
     }
 }
 
-/// `true` when a refresh-grant HTTP error means "this refresh token is
-/// definitively dead" (4xx family: rotated away / revoked / expired) rather
-/// than "the network or the auth server hiccuped" (transport / 5xx).
-fn is_definitive_rejection(e: &reqwest::Error) -> bool {
-    matches!(e.status(), Some(status) if (400..500).contains(&status.as_u16()))
+/// `true` for a *definitive* token-endpoint rejection (OAuth 4xx other
+/// than 429): rotated away / revoked / expired. 429 is its own variant
+/// ([`AuthError::TokenMintRateLimited`]) and is transient — it must never
+/// trigger the stale-store wipe.
+fn is_definitive_rejection(e: &AuthError) -> bool {
+    matches!(
+        e,
+        AuthError::TokenEndpoint {
+            status: 400..500,
+            ..
+        }
+    )
+}
+
+/// Reads status/headers/body of a failed token-endpoint response into the
+/// structured `AuthError` (429 → [`AuthError::TokenMintRateLimited`]; else
+/// [`AuthError::TokenEndpoint`] with the OAuth body parsed when present).
+///
+/// Body-before-status discipline (same as `device.rs`'s `classify`):
+/// headers and body are read *before* any mapping — `error_for_status()`
+/// would discard both the OAuth error body and the `Trace-Id`.
+async fn read_token_error(resp: reqwest::Response) -> AuthError {
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let body = resp.text().await.unwrap_or_default();
+
+    if status == 429 {
+        return AuthError::TokenMintRateLimited {
+            retry_after: crate::resilience::parse_retry_after(&headers),
+            trace_id: crate::resilience::extract_trace_id(&headers),
+        };
+    }
+    let oauth = crate::resilience::parse_oauth_error(&body);
+    AuthError::TokenEndpoint {
+        status,
+        error: oauth.as_ref().map(|o| o.error.clone()),
+        error_description: oauth.and_then(|o| o.error_description),
+        trace_id: crate::resilience::extract_trace_id(&headers),
+    }
 }
 
 /// A point-in-time snapshot of the token state, for the `/auth/status`
@@ -1256,6 +1324,94 @@ mod tests {
         assert!(
             msg.contains("allegro-mcp auth device"),
             "the error must point at the CLI command, got: {msg}"
+        );
+    }
+
+    // ── Phase 9: mint-path error taxonomy ───────────────────────────────────
+
+    #[test]
+    fn token_mint_429_display_mentions_churn_and_no_retry() {
+        let err = AuthError::TokenMintRateLimited {
+            retry_after: Some(Duration::from_secs(1)),
+            trace_id: None,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("429"), "got: {msg}");
+        assert!(
+            msg.contains("token churn too high"),
+            "the actionable copy must name the cause, got: {msg}"
+        );
+        assert!(
+            msg.contains("not retried"),
+            "the copy must say it is never auto-retried, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn token_endpoint_error_carries_status_and_body() {
+        let err = AuthError::TokenEndpoint {
+            status: 401,
+            error: Some("invalid_client".to_owned()),
+            error_description: Some("Client authentication failed".to_owned()),
+            trace_id: Some("tr-x".to_owned()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "got: {msg}");
+        assert!(msg.contains("invalid_client"), "got: {msg}");
+        assert!(msg.contains("Client authentication failed"), "got: {msg}");
+    }
+
+    /// The Phase 9 store-wipe regression guard: a mint-side 429 is
+    /// *transient* — it must surface immediately (never auto-retried) and
+    /// must NOT wipe the token store. (Pre-Phase 9 it surfaced as a 4xx
+    /// `AuthError::Http`, which the stale-store guard read as a definitive
+    /// rejection and cleared the file.)
+    #[tokio::test]
+    async fn refresh_grant_429_does_not_wipe_store() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "1")
+                    .insert_header("Trace-Id", "tr-mint"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("tokens.json");
+        // Expired access token + young refresh token: resolution must run
+        // the refresh grant, which hits the 429.
+        let now = token_store::epoch_now();
+        let envelope = serde_json::json!({
+            "version": 1,
+            "env": "production",
+            "tokens": {
+                "access_token": "expired-access",
+                "refresh_token": "rfr",
+                "expires_at_epoch": now - 10,
+                "scope": "allegro:api:read",
+                "updated_at_epoch": now,
+            }
+        });
+        std::fs::write(&store_path, envelope.to_string()).expect("seed store");
+
+        let auth =
+            AllegroAuth::with_base_url("id".to_owned(), "secret".to_owned(), mock_server.uri())
+                .with_token_store(token_store::TokenStore::new(store_path.clone(), false));
+
+        let err = auth
+            .token()
+            .await
+            .expect_err("the mint 429 must surface immediately");
+        assert!(
+            matches!(err, AuthError::TokenMintRateLimited { .. }),
+            "expected TokenMintRateLimited, got: {err:?}"
+        );
+        assert!(
+            store_path.exists(),
+            "a mint-side 429 must NOT wipe the token store"
         );
     }
 }

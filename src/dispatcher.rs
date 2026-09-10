@@ -12,6 +12,10 @@ const MAX_BODY_BYTES: usize = 102_400;
 /// Delegates to [`crate::config::api_base_url`] — the single source of truth
 /// shared with the auth-host selection, so the sandbox flag can never swap
 /// one host but not the other.
+// Bin-tree dead code since Phase 9: the server dispatches through
+// `dispatch_with_resilience` and derives the base itself; this helper backs
+// the test-facing `dispatch`/`dispatch_with_base` pair (lib + unit tests).
+#[allow(dead_code)]
 fn allegro_api_base(sandbox: bool) -> &'static str {
     crate::config::api_base_url(sandbox)
 }
@@ -110,6 +114,10 @@ fn truncate_body(body: String) -> String {
 /// Dispatches an HTTP request for the given tool and arguments, returning
 /// the response body as text (truncated to 100 KB) on success, or an error
 /// message on failure.
+// Bin-tree dead code since Phase 9 (the server calls
+// `dispatch_with_resilience` directly); kept as the public backward-compat
+// surface for the lib crate and the unit tests below.
+#[allow(dead_code)]
 pub async fn dispatch(
     auth: &crate::auth::AllegroAuth,
     http: &reqwest::Client,
@@ -127,7 +135,9 @@ pub async fn dispatch(
 /// `tests/` — which are compiled as a separate crate — can inject a wiremock
 /// base URL without changing the production public API. Production callers
 /// should use [`dispatch`] instead.
+// Bin-tree dead code since Phase 9 — same rationale as [`dispatch`].
 #[doc(hidden)]
+#[allow(dead_code)]
 pub async fn dispatch_with_base(
     auth: &crate::auth::AllegroAuth,
     http: &reqwest::Client,
@@ -135,13 +145,47 @@ pub async fn dispatch_with_base(
     tool_def: &crate::tool_registry::ToolDef,
     arguments: serde_json::Map<String, Value>,
 ) -> Result<String, String> {
-    let token = auth.token().await.map_err(|e| format!("auth error: {e}"))?;
+    dispatch_with_resilience(
+        auth,
+        http,
+        api_base,
+        tool_def,
+        arguments,
+        &crate::resilience::Resilience::unguarded(),
+    )
+    .await
+    .map_err(|e| e.report())
+}
+
+/// Full-resilience dispatch: the Phase 9 attempt loop (budget acquire →
+/// send → 401 refresh → classify 429/5xx/success). `pub` +
+/// `#[doc(hidden)]` so integration tests (separate crate) can inject
+/// wiremock + `Resilience::test_instant()`. Production callers reach it
+/// through `AllegroServer::call_tool`, which passes the config-driven
+/// budget; the legacy [`dispatch`]/[`dispatch_with_base`] wrappers run it
+/// unguarded (backoff on, no budget — their signatures cannot carry a
+/// shared budget handle).
+#[doc(hidden)]
+pub async fn dispatch_with_resilience(
+    auth: &crate::auth::AllegroAuth,
+    http: &reqwest::Client,
+    api_base: &str,
+    tool_def: &crate::tool_registry::ToolDef,
+    arguments: serde_json::Map<String, Value>,
+    res: &crate::resilience::Resilience,
+) -> Result<String, crate::resilience::DispatchError> {
+    use crate::resilience::{self, DispatchError};
+
+    let mut token = auth
+        .token()
+        .await
+        .map_err(|e| DispatchError::Auth(resilience::render_auth_error(&e)))?;
 
     let (path, consumed) = substitute_path_params(&tool_def.path, &arguments);
     let url = format!("{}{}", api_base, path);
 
     let method = reqwest::Method::from_bytes(tool_def.method.to_uppercase().as_bytes())
-        .map_err(|_| format!("unsupported HTTP method: {}", tool_def.method))?;
+        .map_err(|_| DispatchError::Bad(format!("unsupported HTTP method: {}", tool_def.method)))?;
 
     let mut remaining = arguments;
     for name in &consumed {
@@ -157,9 +201,9 @@ pub async fn dispatch_with_base(
         .as_deref()
         .unwrap_or(crate::http::DEFAULT_ACCEPT);
 
-    // The request "plan" is computed once so the 401 retry below can rebuild
-    // the request from identical inputs (`remaining` is consumed while
-    // shaping the body; the plan freezes the result).
+    // The request "plan" is computed once so the retry loop below can
+    // rebuild the request from identical inputs (`remaining` is consumed
+    // while shaping the body; the plan freezes the result).
     enum Plan {
         Query(Vec<(String, String)>),
         ReservedBody(Value),
@@ -201,50 +245,116 @@ pub async fn dispatch_with_base(
         }
     };
 
-    let response = build(&token)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP error: {e}"))?;
+    // ── Phase 9 attempt loop ───────────────────────────────────────────────
+    //
+    // Bounded: ≤ 1 initial send + 3 429-retries + 1 5xx-retry + (inside the
+    // sends) one 401-refresh re-send. Budget is acquired per API send —
+    // retries are real requests. The 401-refresh hook (Phase 5) is the
+    // innermost concern: a 429 never triggers refresh; a 401 arriving after
+    // the refresh was already spent falls through to the `Client` error
+    // mapping, preserving the historical "persistent 401 surfaces the
+    // retry body" semantics.
+    let mut retries_429: u32 = 0;
+    let mut retries_5xx: u32 = 0;
+    let mut sends: u32 = 0; // total API sends (incl. the 401-refresh re-send)
+    let mut refreshed = false; // one 401-refresh per dispatch (Phase 5)
+    let method_idempotent = resilience::is_idempotent(&method);
 
-    // Single 401 retry with forced token re-resolution. Device tokens are
-    // user-scoped and die out-of-band (password change, app unlink, the
-    // 20-active-sessions cap — none of which the 60 s pre-expiry refresh
-    // can see), and a plain re-read would hand back the very token the API
-    // just rejected: an out-of-band revocation never changes the stored
-    // token's expiry, so `refresh_now` skips the stored live token and
-    // exercises the device-mode refresh grant. A definitive refresh
-    // rejection propagates here as "auth error: re-authorization required:
-    // … — run `allegro-mcp auth device`". Exactly one retry, bounded: if
-    // the retry also fails, its error is returned (the post-refresh body
-    // is more diagnostic than the original 401's).
-    let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let fresh = auth
-            .refresh_now()
-            .await
-            .map_err(|e| format!("auth error: {e}"))?;
-        build(&fresh)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP error: {e}"))?
-    } else {
-        response
-    };
+    loop {
+        if let Some(budget) = &res.budget {
+            budget.acquire().await?; // BudgetExceeded propagates; never sent
+        }
 
-    let status = response.status();
-    if status.is_client_error() || status.is_server_error() {
+        let response = match build(&token).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(DispatchError::Unreachable {
+                    source_text: e.to_string(),
+                })
+            }
+        };
+        sends += 1;
+
+        // Headers first: capture everything before `.text()` consumes the
+        // body — Trace-Id and Retry-After must survive every classification.
+        let trace_id = resilience::extract_trace_id(response.headers());
+        let retry_after = resilience::parse_retry_after(response.headers());
+
+        // 401 → forced refresh + re-send, once per dispatch (Phase 5 logic,
+        // moved inside the loop; the first 401's body is still discarded).
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+            refreshed = true;
+            token = auth
+                .refresh_now()
+                .await
+                .map_err(|e| DispatchError::Auth(resilience::render_auth_error(&e)))?;
+            continue; // budget re-acquired on the re-send
+        }
+
+        let status = response.status();
+
+        // 429 → back off and retry, any method (a 429 means the request was
+        // rejected *before* processing — replaying a POST is safe).
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            && retries_429 < resilience::MAX_429_RETRIES
+        {
+            retries_429 += 1;
+            tracing::warn!(retries_429, ?retry_after, ?trace_id, "429 — backing off");
+            res.backoff
+                .sleep(res.backoff.delay_for(retries_429, retry_after))
+                .await;
+            continue;
+        }
+
+        // 5xx → single retry, idempotent methods only (the request *may*
+        // have been processed — replaying a POST risks duplicate offers).
+        if status.is_server_error()
+            && retries_5xx < resilience::MAX_5XX_RETRIES
+            && method_idempotent
+        {
+            retries_5xx += 1;
+            tracing::warn!(status = %status, ?trace_id, "5xx — single retry");
+            res.backoff
+                .sleep(res.backoff.delay_for(retries_5xx, None))
+                .await;
+            continue;
+        }
+
         let body = response
             .text()
             .await
-            .map_err(|e| format!("HTTP error: {e}"))?;
-        return Err(format!("HTTP {status}: {body}"));
+            .map_err(|e| DispatchError::Unreachable {
+                source_text: e.to_string(),
+            })?;
+
+        if status.is_success() {
+            return Ok(truncate_body(body));
+        }
+        return Err(match status.as_u16() {
+            // `attempts` is pinned to the total wire-observable send count
+            // (the `sends` counter) so wiremock hit-count assertions can
+            // never disagree with the report; `retry_after`/`trace_id`
+            // come from the LAST 429's headers.
+            429 => DispatchError::RateLimited {
+                attempts: sends,
+                retry_after,
+                trace_id,
+                body,
+            },
+            s if s >= 500 => DispatchError::Server {
+                status: s,
+                retries: retries_5xx,
+                trace_id,
+                body,
+            },
+            s => DispatchError::Client {
+                status: s,
+                trace_id,
+                allegro: resilience::parse_allegro_errors(&body),
+                body,
+            },
+        });
     }
-
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("HTTP error: {e}"))?;
-
-    Ok(truncate_body(body))
 }
 
 #[cfg(test)]
@@ -687,5 +797,452 @@ mod tests {
             err.contains("auth error"),
             "re-resolve failure must surface as 'auth error', got: {err}"
         );
+    }
+
+    // ── Phase 9: resilience attempt loop (instant policy — zero sleeps) ──────
+
+    use crate::resilience::{BackoffPolicy, RateBudget, Resilience};
+
+    async fn dispatch_instant(
+        auth: &crate::auth::AllegroAuth,
+        api_base: &str,
+        tool_def: &crate::tool_registry::ToolDef,
+        res: &Resilience,
+    ) -> Result<String, String> {
+        dispatch_with_resilience(
+            auth,
+            &reqwest::Client::new(),
+            api_base,
+            tool_def,
+            serde_json::Map::new(),
+            res,
+        )
+        .await
+        .map_err(|e| e.report())
+    }
+
+    async fn count_hits(mock_server: &wiremock::MockServer, path_fragment: &str) -> usize {
+        mock_server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .filter(|r| r.url.path() == path_fragment)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_429_twice_then_200_succeeds() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        // API: 429 exactly twice, then 200 (limited mock mounted FIRST).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "0")
+                    .insert_header("Trace-Id", "tr-429"),
+            )
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        let out = dispatch_instant(
+            &auth,
+            &mock_server.uri(),
+            &get_offers_tool(),
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect("429s must be retried with backoff until success");
+        assert_eq!(out, "[]");
+
+        assert_eq!(
+            count_hits(&mock_server, "/sale/offers").await,
+            3,
+            "2 rate-limited sends + 1 successful"
+        );
+        assert_eq!(
+            count_hits(&mock_server, "/auth/oauth/token").await,
+            1,
+            "the token is fetched once and cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persistent_429_fails_cleanly_with_trace_id() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "1")
+                    .insert_header("Trace-Id", "tr-429"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        let err = dispatch_instant(
+            &auth,
+            &mock_server.uri(),
+            &get_offers_tool(),
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect_err("persistent 429 must fail after the retry budget");
+        assert!(err.contains("429"), "got: {err}");
+        assert!(err.contains("Trace-Id: tr-429"), "got: {err}");
+        assert!(err.contains("rate limited"), "got: {err}");
+
+        assert_eq!(
+            count_hits(&mock_server, "/sale/offers").await,
+            4,
+            "initial send + 3 retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_5xx_once_then_200_retries_get() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        // 503 exactly once, then 200 (limited mock mounted FIRST).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        let out = dispatch_instant(
+            &auth,
+            &mock_server.uri(),
+            &get_offers_tool(),
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect("a single 5xx on a GET must be retried");
+        assert_eq!(out, "[]");
+        assert_eq!(
+            count_hits(&mock_server, "/sale/offers").await,
+            2,
+            "one 503 + one 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persistent_5xx_fails_after_single_retry() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(503).insert_header("Trace-Id", "tr-503"))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        let err = dispatch_instant(
+            &auth,
+            &mock_server.uri(),
+            &get_offers_tool(),
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect_err("persistent 5xx must fail after a single retry");
+        assert!(err.contains("503"), "got: {err}");
+        assert!(err.contains("Trace-Id:"), "got: {err}");
+        assert_eq!(
+            count_hits(&mock_server, "/sale/offers").await,
+            2,
+            "5xx gets exactly one retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_5xx_post_is_not_retried() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+        let post_tool = crate::tool_registry::ToolDef {
+            id: "allegro_create_offer".to_string(),
+            name: "allegro_create_offer".to_string(),
+            description: "Create an offer".to_string(),
+            input_schema: serde_json::json!({}),
+            method: "post".to_string(),
+            path: "/sale/offers".to_string(),
+            accept_media_type: None,
+        };
+
+        let err = dispatch_instant(
+            &auth,
+            &mock_server.uri(),
+            &post_tool,
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect_err("5xx on a POST must fail (no retry)");
+        assert!(err.contains("500"), "got: {err}");
+        assert_eq!(
+            count_hits(&mock_server, "/sale/offers").await,
+            1,
+            "POST is not idempotent — exactly one send (method gate)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_network_error_maps_to_unreachable() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        // Port 9 (discard) on loopback: connection refused — deterministic
+        // transport failure, no wiremock server to answer.
+        let err = dispatch_instant(
+            &auth,
+            "http://127.0.0.1:9",
+            &get_offers_tool(),
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect_err("an unreachable API must fail");
+        assert!(
+            err.contains("could not be reached"),
+            "the user copy must explain reachability, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_budget_guard_blocks_second_dispatch() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        let res = Resilience {
+            backoff: BackoffPolicy::test_instant(),
+            budget: Some(std::sync::Arc::new(RateBudget::new_for_tests(
+                1,
+                std::time::Duration::ZERO,
+            ))),
+        };
+
+        let first = dispatch_instant(&auth, &mock_server.uri(), &get_offers_tool(), &res).await;
+        assert_eq!(first.expect("the first dispatch fits the cap"), "[]");
+
+        let err = dispatch_instant(&auth, &mock_server.uri(), &get_offers_tool(), &res)
+            .await
+            .expect_err("the second dispatch exceeds the cap");
+        assert!(
+            err.contains("rate budget"),
+            "the budget error must be identifiable, got: {err}"
+        );
+        assert_eq!(
+            count_hits(&mock_server, "/sale/offers").await,
+            1,
+            "the blocked request was never sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_mint_429_is_never_retried() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Token endpoint: 200 exactly once (the initial fetch), then 429 —
+        // the post-401 forced re-resolve hits it. Limited mock FIRST.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "access_token": "tok", "token_type": "bearer", "expires_in": 43199 }),
+            ))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "1")
+                    .insert_header("Trace-Id", "tr-mint-429"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // API: always 401, so the forced re-resolve runs.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        let err = dispatch_instant(
+            &auth,
+            &mock_server.uri(),
+            &get_offers_tool(),
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect_err("a mint-side 429 must fail the dispatch");
+        assert!(err.contains("auth error"), "got: {err}");
+        assert!(err.contains("token churn"), "got: {err}");
+        // The token endpoint's Trace-Id must reach the report (the
+        // "Trace-Id in all error paths" bullet, auth-surface twin).
+        assert!(err.contains("Trace-Id: tr-mint-429"), "got: {err}");
+
+        assert_eq!(
+            count_hits(&mock_server, "/auth/oauth/token").await,
+            2,
+            "initial fetch + the single forced re-resolve — no retry loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oauth_error_body_mapped_from_token_endpoint() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "invalid_client",
+                    "error_description": "bad id"
+                })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        let err = dispatch_instant(
+            &auth,
+            &mock_server.uri(),
+            &get_offers_tool(),
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect_err("a token-endpoint 400 must fail the dispatch");
+        assert!(err.contains("invalid_client"), "got: {err}");
+        assert!(err.contains("bad id"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_allegro_error_body_mapped_from_api() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        // The guideline's canonical 422 body (§0.1 of the Phase 9 plan).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(422)
+                    .insert_header("Trace-Id", "tr-422")
+                    .set_body_json(serde_json::json!({
+                        "errors": [{
+                            "message": "Delivery point data not passed",
+                            "code": "MissingDeliveryPointException",
+                            "details": null,
+                            "path": "Endpoint.getDeliveries.arg1",
+                            "userMessage": "Nie wybrano punktu dla odbioru osobistego."
+                        }]
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+
+        let err = dispatch_instant(
+            &auth,
+            &mock_server.uri(),
+            &get_offers_tool(),
+            &Resilience::test_instant(),
+        )
+        .await
+        .expect_err("a 422 must fail the dispatch");
+        assert!(
+            err.contains("MissingDeliveryPointException"),
+            "the Dev line must carry the code, got: {err}"
+        );
+        assert!(
+            err.contains("Nie wybrano punktu"),
+            "the User line must prefer Allegro's userMessage, got: {err}"
+        );
+        assert!(err.contains("Trace-Id: tr-422"), "got: {err}");
     }
 }

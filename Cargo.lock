@@ -19,6 +19,7 @@ dependencies = [
  "axum",
  "clap",
  "dirs",
+ "httpdate",
  "openapiv3",
  "reqwest",
  "rmcp",
