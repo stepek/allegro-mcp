@@ -12,6 +12,10 @@ services:
       # /auth/status. Off by default — see docs/open-webui.md and
       # SECURITY.md before exposing this port beyond a private network.
       ALLEGRO_MCP_SERVER_TOKEN: ${ALLEGRO_MCP_SERVER_TOKEN:-}
+      # OAuth2 flow selection: empty/unset keeps the `client_credentials`
+      # default; set `device_code` for the user device flow (see README
+      # "Headless login").
+      ALLEGRO_MCP_AUTH_FLOW: ${ALLEGRO_MCP_AUTH_FLOW:-}
       # Comma-separated allow-list for the inbound Host header. Includes
       # the compose service name so Open WebUI's requests (Host:
       # allegro-mcp:8080) aren't rejected by the DNS-rebinding guard.

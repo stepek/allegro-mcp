@@ -107,6 +107,31 @@ it refuses to start and points at `allegro-mcp auth device`.
 | Env var | Purpose | Default |
 |---|---|---|
 | `ALLEGRO_MCP_TOKEN_PATH` | Overrides where device-flow tokens are persisted (beats `token_path` in the config) | unset |
+| `ALLEGRO_MCP_AUTH_FLOW` | Selects the OAuth2 flow (`client_credentials` / `device_code`); beats `auth_flow` in the config file | unset |
+
+#### Compose / Portainer (no CLI)
+
+There is no CLI flag for the flow — the config file or the
+`ALLEGRO_MCP_AUTH_FLOW` environment variable select it, so
+compose/Portainer deployments can enable the device flow without
+hand-writing a TOML file:
+
+- **A1 (one stack, temp command):** in the stack editor set
+  `command: ["--sandbox", "auth", "device"]` and
+  `ALLEGRO_MCP_AUTH_FLOW: "device_code"`, deploy, open the
+  `verification_uri_complete` URL from the container logs, approve in the
+  browser, then remove the `command:` line and redeploy. Tokens land in
+  the `allegro-mcp-tokens` volume; the server restores/refreshes them on
+  start.
+- **A2 (one-off container):** Containers → Add container → same image,
+  command `--sandbox auth device`, same env vars, mount the stack's
+  volume (`<project>_allegro-mcp-tokens`, visible in the stack's volumes
+  tab) at `/root/.config/allegro-mcp`, read the logs, approve, then
+  remove the container.
+
+The runtime image is distroless (no shell) — the Portainer "Console" tab
+cannot be used; the container logs and the browser approval are all
+that's needed.
 
 ## Key design decisions
 

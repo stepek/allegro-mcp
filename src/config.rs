@@ -52,9 +52,13 @@ pub enum ConfigError {
     /// (a wrong-guess sandbox/prod mix would send prod tokens to sandbox).
     #[error(
         "invalid value for environment variable {var}: {value:?} \
-         (expected one of true/1/yes or false/0/no)"
+         (expected {expected})"
     )]
-    InvalidEnv { var: &'static str, value: String },
+    InvalidEnv {
+        var: &'static str,
+        expected: &'static str,
+        value: String,
+    },
 
     /// A `scopes` entry would corrupt the space-joined OAuth2 `scope` param.
     #[error("invalid scope entry {value:?}: {reason}")]
@@ -71,9 +75,12 @@ pub enum ConfigError {
 /// code + verification URL + polling) and persists the rotating token pair
 /// at [`Config::token_path`], which the server then restores/refreshes.
 ///
-/// With `#[serde(rename_all = "snake_case")]`, TOML writes
+/// Selectable via `auth_flow` in the config file **or** the
+/// `ALLEGRO_MCP_AUTH_FLOW` environment variable (env beats the file). With
+/// `#[serde(rename_all = "snake_case")]`, TOML writes
 /// `auth_flow = "client_credentials"` / `"device_code"`. Unknown values are
-/// startup errors listing the supported ones.
+/// startup errors listing the supported ones. Adding a variant here must be
+/// accompanied by extending the env `match` in [`Config::apply_env`].
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthFlow {
@@ -388,6 +395,11 @@ impl Config {
 
     /// Applies `ALLEGRO_MCP_*` environment overrides on top of `cfg`.
     ///
+    /// `ALLEGRO_MCP_AUTH_FLOW` selects the OAuth2 flow (see [`AuthFlow`]),
+    /// beating the config file's `auth_flow`; an empty/whitespace value is
+    /// ignored so the file value survives, and an unknown value is a hard
+    /// [`ConfigError::InvalidEnv`] startup error.
+    ///
     /// Setting one schema-source variable shadows the other field (env file
     /// wins over env url, and both beat anything from the config file),
     /// mirroring the fixed resolution order — see [`Config::load`].
@@ -409,6 +421,26 @@ impl Config {
             let v = v.trim();
             if !v.is_empty() {
                 cfg.token_path = Some(PathBuf::from(v));
+            }
+        }
+        // OAuth2 flow override (env beats the config file's `auth_flow`).
+        // Same empty-value hygiene as `ALLEGRO_MCP_TOKEN_PATH` above: a
+        // blank value is ignored so the file value survives. Adding an
+        // `AuthFlow` variant must extend this match (see the enum's doc).
+        if let Ok(v) = std::env::var("ALLEGRO_MCP_AUTH_FLOW") {
+            let v = v.trim();
+            if !v.is_empty() {
+                cfg.auth_flow = match v {
+                    "client_credentials" => AuthFlow::ClientCredentials,
+                    "device_code" => AuthFlow::DeviceCode,
+                    _ => {
+                        return Err(ConfigError::InvalidEnv {
+                            var: "ALLEGRO_MCP_AUTH_FLOW",
+                            expected: "one of client_credentials or device_code",
+                            value: v.to_owned(),
+                        })
+                    }
+                };
             }
         }
         // URL before FILE so that, when both env vars are set, the file wins
@@ -526,6 +558,7 @@ fn parse_env_bool(var: &'static str, value: &str) -> Result<bool, ConfigError> {
         "false" | "0" | "no" => Ok(false),
         _ => Err(ConfigError::InvalidEnv {
             var,
+            expected: "one of true/1/yes or false/0/no",
             value: value.to_owned(),
         }),
     }
@@ -952,7 +985,11 @@ mod tests {
             let mut cfg = Config::default();
             let err = Config::apply_env(&mut cfg).expect_err("'maybe' must be rejected");
             assert!(
-                matches!(&err, ConfigError::InvalidEnv { var, value } if *var == "ALLEGRO_MCP_SANDBOX" && value == "maybe"),
+                matches!(
+                    &err,
+                    ConfigError::InvalidEnv { var, value, .. }
+                        if *var == "ALLEGRO_MCP_SANDBOX" && value == "maybe"
+                ),
                 "expected InvalidEnv, got: {err:?}"
             );
             // Never silently false: the config must not have been flipped.
@@ -1085,6 +1122,87 @@ mod tests {
                 cfg.token_path.as_deref(),
                 Some(Path::new("/from/config-file.json")),
                 "an empty env value must be ignored, never clobber the file value"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn env_auth_flow_selects_device_code() {
+        with_env(&[("ALLEGRO_MCP_AUTH_FLOW", Some("device_code"))], || {
+            let mut cfg = Config::default();
+            Config::apply_env(&mut cfg).expect("valid flow must apply");
+            assert_eq!(
+                cfg.auth_flow,
+                AuthFlow::DeviceCode,
+                "ALLEGRO_MCP_AUTH_FLOW=device_code must select the device flow"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn env_auth_flow_beats_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allegro-mcp.toml");
+        std::fs::write(&path, "auth_flow = \"device_code\"\n").expect("write config file");
+
+        with_env(
+            &[
+                ("ALLEGRO_MCP_CONFIG", Some(path.to_str().unwrap())),
+                ("ALLEGRO_MCP_AUTH_FLOW", Some("client_credentials")),
+                ("ALLEGRO_MCP_SANDBOX", None),
+                ("ALLEGRO_MCP_USER_AGENT", None),
+                ("ALLEGRO_MCP_ACCEPT_LANGUAGE", None),
+                ("ALLEGRO_MCP_SCHEMA_URL", None),
+                ("ALLEGRO_MCP_SCHEMA_FILE", None),
+                ("ALLEGRO_MCP_TOKEN_PATH", None),
+            ],
+            || {
+                let cfg = Config::load(&CliOverrides::default()).expect("load");
+                assert_eq!(
+                    cfg.auth_flow,
+                    AuthFlow::ClientCredentials,
+                    "env ALLEGRO_MCP_AUTH_FLOW must beat the config file's auth_flow"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn env_auth_flow_unknown_value_is_invalid_env() {
+        with_env(&[("ALLEGRO_MCP_AUTH_FLOW", Some("banana"))], || {
+            let mut cfg = Config::default();
+            let err = Config::apply_env(&mut cfg).expect_err("'banana' must be rejected");
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::InvalidEnv {
+                        var: "ALLEGRO_MCP_AUTH_FLOW",
+                        expected: "one of client_credentials or device_code",
+                        value,
+                    } if value == "banana"
+                ),
+                "expected InvalidEnv for ALLEGRO_MCP_AUTH_FLOW, got: {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn env_auth_flow_blank_is_ignored() {
+        with_env(&[("ALLEGRO_MCP_AUTH_FLOW", Some("   "))], || {
+            let mut cfg = Config {
+                // Pretend the config file selected the device flow.
+                auth_flow: AuthFlow::DeviceCode,
+                ..Config::default()
+            };
+            Config::apply_env(&mut cfg).expect("a blank value must not error");
+            assert_eq!(
+                cfg.auth_flow,
+                AuthFlow::DeviceCode,
+                "a whitespace-only env value must be ignored, never clobber the file value"
             );
         });
     }
