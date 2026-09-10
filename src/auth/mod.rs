@@ -635,4 +635,18 @@ mod tests {
         assert!(status.expires_in_secs.is_some());
         assert_eq!(status.auth_flow, "client_credentials");
     }
+
+    #[tokio::test]
+    async fn status_reports_invalid_when_token_expired() {
+        let auth = AllegroAuth::new("id".to_owned(), "secret".to_owned(), false);
+        // Seed an expired token
+        let expired = CachedToken {
+            access_token: "expired".to_owned(),
+            expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        };
+        *auth.cache.write().await = Some(expired);
+        let status = auth.status().await;
+        assert!(status.token_cached);
+        assert!(!status.token_valid);
+    }
 }

@@ -165,6 +165,87 @@ async fn auth_status_with_server_token_requires_bearer() {
         .await
         .expect("GET /auth/status (correct token)");
     assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("parse json");
+    assert_eq!(body["auth_flow"], "client_credentials");
+
+    // Lowercase "bearer" scheme must be rejected (case-sensitive prefix match).
+    let resp = client
+        .get(format!("{base_url}/auth/status"))
+        .header("Authorization", "bearer secret-token")
+        .send()
+        .await
+        .expect("GET /auth/status (lowercase bearer)");
+    assert_eq!(resp.status(), 401);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mcp_endpoint_requires_bearer_when_server_token_configured() {
+    let registry = build_registry().await;
+    let mock_server = mock_token_server().await;
+    let auth =
+        AllegroAuth::with_base_url("id".to_string(), "secret".to_string(), mock_server.uri());
+    let server = AllegroServer::new(registry, auth, false);
+    let auth_handle = server.auth_handle();
+    let mcp_service = build_mcp_service(server);
+
+    let state = AppState::new(auth_handle, Some(Arc::from("secret-token")));
+    let router = build_router(state, mcp_service);
+    let (base_url, handle) = spawn_router(router).await;
+
+    let client = reqwest::Client::new();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "test-client", "version": "0.0.1" }
+        }
+    });
+
+    let resp = client
+        .post(format!("{base_url}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /mcp without Authorization header");
+
+    assert_eq!(resp.status(), 401);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mcp_get_without_session_returns_client_error() {
+    let registry = build_registry().await;
+    let mock_server = mock_token_server().await;
+    let auth =
+        AllegroAuth::with_base_url("id".to_string(), "secret".to_string(), mock_server.uri());
+    let server = AllegroServer::new(registry, auth, false);
+    let auth_handle = server.auth_handle();
+    let mcp_service = build_mcp_service(server);
+
+    let state = AppState::new(auth_handle, None);
+    let router = build_router(state, mcp_service);
+    let (base_url, handle) = spawn_router(router).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base_url}/mcp"))
+        .send()
+        .await
+        .expect("GET /mcp without session");
+
+    assert!(
+        resp.status().is_client_error(),
+        "GET /mcp without a session ID must return a 4xx status, got: {}",
+        resp.status()
+    );
 
     handle.abort();
 }

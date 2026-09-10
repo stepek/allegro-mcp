@@ -265,15 +265,29 @@ mod tests {
         assert!(!constant_time_eq(b"short", b"much-longer-value"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_allowed_hosts_defaults_to_loopback_when_env_absent() {
-        // SAFETY-of-intent: serial_test avoids cross-test env races (see
-        // Cargo.toml [dev-dependencies]); this test only reads the var, so
-        // relies on the CI/dev shell not exporting it. Mirrors the
-        // env-absent test pattern in src/auth/mod.rs.
-        if std::env::var(ALLOWED_HOSTS_ENV).is_err() {
-            let hosts = resolve_allowed_hosts();
-            assert_eq!(hosts, vec!["localhost", "127.0.0.1", "::1"]);
-        }
+        std::env::remove_var(ALLOWED_HOSTS_ENV);
+        let hosts = resolve_allowed_hosts();
+        assert_eq!(hosts, vec!["localhost", "127.0.0.1", "::1"]);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn resolve_allowed_hosts_returns_empty_for_wildcard() {
+        std::env::set_var(ALLOWED_HOSTS_ENV, "*");
+        let hosts = resolve_allowed_hosts();
+        std::env::remove_var(ALLOWED_HOSTS_ENV);
+        assert!(hosts.is_empty());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn resolve_allowed_hosts_parses_comma_separated_list() {
+        std::env::set_var(ALLOWED_HOSTS_ENV, "host-a, host-b");
+        let hosts = resolve_allowed_hosts();
+        std::env::remove_var(ALLOWED_HOSTS_ENV);
+        assert_eq!(hosts, vec!["host-a", "host-b"]);
     }
 }
