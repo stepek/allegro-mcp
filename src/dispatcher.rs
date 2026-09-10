@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(api_hits, 2, "the API must be hit twice (401 then 200)");
         assert_eq!(
             token_hits, 2,
-            "the token must be re-resolved after the 401 (invalidate + token)"
+            "the token must be re-resolved after the 401 (refresh_now)"
         );
     }
 

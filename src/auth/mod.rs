@@ -681,10 +681,13 @@ impl AllegroAuth {
         Ok(())
     }
 
-    /// Forces a re-resolution right now: drops the in-memory cache, sets
-    /// the one-shot forced-refresh flag (consumed by
-    /// [`Self::resolve_device_token`]), then runs the [`Self::token`]
-    /// chain. In device mode the stored *live* access token is skipped and
+    /// Forces a re-resolution right now: sets the one-shot forced-refresh
+    /// flag (consumed by [`Self::resolve_device_token`]) *before* dropping
+    /// the in-memory cache, then runs the [`Self::token`] chain. Flag-first
+    /// ordering closes a race: a concurrent plain [`Self::token`] could
+    /// otherwise acquire the write lock between the cache drop and the
+    /// flag store and repopulate the cache from the revoked stored token.
+    /// In device mode the stored *live* access token is skipped and
     /// the single-use refresh grant gets the first shot — the stored token
     /// remains the fallback when the refresh fails transiently (5xx /
     /// transport), while a definitive rejection propagates as
@@ -697,8 +700,10 @@ impl AllegroAuth {
     /// would hand back the very token the API just rejected, because an
     /// out-of-band revocation never changes the stored `expires_at_epoch`.
     pub async fn refresh_now(&self) -> Result<String, AuthError> {
-        self.invalidate().await;
+        // Flag BEFORE invalidate: see the doc comment — a concurrent plain
+        // `token()` must not repopulate the cache from the revoked token.
         self.force_refresh.store(true, Ordering::SeqCst);
+        self.invalidate().await;
         self.token().await
     }
 }

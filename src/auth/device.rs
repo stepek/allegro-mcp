@@ -659,8 +659,10 @@ mod tests {
     /// HTML error page full of non-ASCII is a realistic 4xx body).
     #[test]
     fn classify_multibyte_4xx_body_does_not_panic() {
-        // 'ł' is 2 bytes in UTF-8: byte 200 of this body splits a codepoint.
-        let body = "ł".repeat(300);
+        // 199 ASCII bytes put byte 200 on the *second* byte of the first
+        // 'ł' (2 bytes in UTF-8) — mid-codepoint, where a naive byte slice
+        // would panic.
+        let body = format!("{}{}", "x".repeat(199), "ł".repeat(300));
         assert!(matches!(
             classify(400, &body),
             PollOutcome::ExpiredOrInvalid
