@@ -828,4 +828,71 @@ mod tests {
             "resume note present, got: {text}"
         );
     }
+
+    // ── resume bridge + production polling policy ─────────────────────────────
+
+    /// The resume decode (`PendingDeviceGrant::to_authorization_response`,
+    /// used by the CLI/server restart path) must rebuild the poll-ready
+    /// response with the *remaining* lifetime: inheriting the original
+    /// `expires_in` would let the restarted poll outlive the actual grant,
+    /// and the saturating subtraction must never underflow on an
+    /// already-expired grant (the CLI's "request a fresh code" branch keys
+    /// off the same stored wall-clock expiry).
+    #[test]
+    fn resume_bridge_rebuilds_the_response_with_remaining_seconds() {
+        let pending = super::super::token_store::PendingDeviceGrant {
+            device_code: "645629715".to_owned(),
+            user_code: "cbt3zdu4g".to_owned(),
+            verification_uri: "https://allegro.pl/skojarz-aplikacje".to_owned(),
+            verification_uri_complete: Some(
+                "https://allegro.pl/skojarz-aplikacje?code=cbt3zdu4g".to_owned(),
+            ),
+            interval_secs: 5,
+            expires_at_epoch: crate::auth::token_store::epoch_now() + 600,
+        };
+
+        let resp = pending.to_authorization_response();
+        assert_eq!(resp.device_code, "645629715");
+        assert_eq!(resp.user_code, "cbt3zdu4g");
+        assert_eq!(resp.interval, 5);
+        assert_eq!(
+            resp.verification_uri_complete.as_deref(),
+            Some("https://allegro.pl/skojarz-aplikacje?code=cbt3zdu4g")
+        );
+        assert!(
+            resp.expires_in > 0 && resp.expires_in <= 600,
+            "expires_in must be the remaining seconds (≤ 600), got {}",
+            resp.expires_in
+        );
+    }
+
+    #[test]
+    fn resume_bridge_of_an_expired_grant_yields_zero_remaining() {
+        let pending = super::super::token_store::PendingDeviceGrant {
+            device_code: "645629715".to_owned(),
+            user_code: "cbt3zdu4g".to_owned(),
+            verification_uri: "https://allegro.pl/skojarz-aplikacje".to_owned(),
+            verification_uri_complete: None,
+            interval_secs: 5,
+            expires_at_epoch: crate::auth::token_store::epoch_now() - 1,
+        };
+        assert_eq!(
+            pending.to_authorization_response().expires_in,
+            0,
+            "an expired grant saturates to 0 s remaining — no u64 underflow"
+        );
+    }
+
+    /// The CLI and server build their poll state via
+    /// `PollingPolicy::production().effective_interval(server_interval)`;
+    /// the production branch must honor the server-mandated interval (the
+    /// `test_instant()` override branch is what the wiremock suites use, so
+    /// without this test the shipping path had no assertion at all).
+    #[test]
+    fn production_policy_honors_the_server_interval() {
+        assert_eq!(
+            PollingPolicy::production().effective_interval(5),
+            Duration::from_secs(5)
+        );
+    }
 }

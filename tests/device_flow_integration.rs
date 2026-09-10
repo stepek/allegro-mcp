@@ -824,3 +824,73 @@ async fn stale_store_guard_transient_retry_failure_keeps_the_newer_pair() {
     assert_eq!(saved.access_token, "b1");
     assert_eq!(saved.refresh_token.as_deref(), Some("r2"));
 }
+
+// ── 9. Device authorization request shape ────────────────────────────────────
+
+/// The `POST /auth/oauth/device` contract: Basic auth header, `client_id`
+/// in the form body, and the optional space-joined `scope` param **only**
+/// when scopes are configured — an empty scope list must keep the body
+/// scope-less (byte-identical to the scope-less flow, mirroring the token
+/// endpoint's convention). All other device-flow tests exercise the empty
+/// scope branch only, so without this test the scope param and the device
+/// endpoint's Basic auth were never asserted anywhere.
+#[tokio::test]
+async fn device_code_request_carries_basic_auth_and_optional_scope() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/device"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(device_json()))
+        .mount(&mock)
+        .await;
+
+    let mut deps = deps_for(&mock, PollingPolicy::test_instant());
+    request_device_code(&deps)
+        .await
+        .expect("scope-less device code request");
+
+    deps.scopes = vec![
+        "allegro:api:read".to_owned(),
+        "allegro:api:write".to_owned(),
+    ];
+    request_device_code(&deps)
+        .await
+        .expect("scoped device code request");
+
+    let reqs = mock.received_requests().await.expect("recorded requests");
+    assert_eq!(reqs.len(), 2, "exactly one request per call");
+    let (scopeless, scoped) = (&reqs[0], &reqs[1]);
+
+    // Basic auth on both (the credentials ride the header, not the body).
+    for req in reqs.iter() {
+        let authz = req
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            authz.starts_with("Basic "),
+            "the device endpoint must use Basic auth, got: {authz:?}"
+        );
+    }
+
+    let scopeless_body = String::from_utf8_lossy(&scopeless.body);
+    assert!(
+        scopeless_body.contains("client_id=id"),
+        "client_id rides the form body, got: {scopeless_body}"
+    );
+    assert!(
+        !scopeless_body.contains("scope="),
+        "an empty scope list must keep the body scope-less, got: {scopeless_body}"
+    );
+
+    let scoped_body = String::from_utf8_lossy(&scoped.body);
+    assert!(
+        scoped_body.starts_with("client_id=id&scope="),
+        "the scope param is appended after client_id, got: {scoped_body}"
+    );
+    assert!(
+        scoped_body.contains("allegro%3Aapi%3Aread")
+            && scoped_body.contains("allegro%3Aapi%3Awrite"),
+        "both scopes must be URL-encoded in the form body, got: {scoped_body}"
+    );
+}
