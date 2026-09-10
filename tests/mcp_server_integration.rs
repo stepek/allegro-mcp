@@ -6,13 +6,14 @@
 use std::path::PathBuf;
 
 use allegro_mcp::auth::AllegroAuth;
+use allegro_mcp::http;
 use allegro_mcp::schema::{self, SchemaSource};
 use allegro_mcp::server::AllegroServer;
 use allegro_mcp::tool_registry::ToolRegistry;
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // `openapiv3` and `serde_yaml` are regular (non-dev) dependencies of the
@@ -666,13 +667,19 @@ async fn test_call_known_tool_with_no_arguments_field_does_not_crash() {
 ///
 /// Uses `AllegroServer::with_api_base_url` to inject the wiremock server URL
 /// so that the dispatcher hits the mock instead of the real Allegro API.
+/// Both mocks require the full ToS header set (User-Agent, Authorization,
+/// Accept, Accept-Language) — any request missing a header falls through to
+/// wiremock's unmatched-response and fails the test, the wiremock equivalent
+/// of the ticket's tcpdump requirement.
 #[tokio::test]
 async fn test_call_tool_happy_path_returns_mocked_body() {
     let mock_server = MockServer::start().await;
 
-    // Mock the OAuth token endpoint.
+    // Mock the OAuth token endpoint (UA comes from the shared default client).
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .and(header("Accept-Language", "pl-PL"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({ "access_token": "test-token", "expires_in": 3600 })),
@@ -680,9 +687,13 @@ async fn test_call_tool_happy_path_returns_mocked_body() {
         .mount(&mock_server)
         .await;
 
-    // Mock the GET /sale/offers endpoint.
+    // Mock the GET /sale/offers endpoint with full header matchers.
     Mock::given(method("GET"))
         .and(path("/sale/offers"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .and(header("Authorization", "Bearer test-token"))
+        .and(header("Accept", "application/vnd.allegro.public.v1+json"))
+        .and(header("Accept-Language", "pl-PL"))
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"offers":[],"count":0}"#))
         .mount(&mock_server)
         .await;
@@ -758,6 +769,7 @@ async fn test_call_tool_response_over_100kb_is_truncated() {
 
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({ "access_token": "test-token", "expires_in": 3600 })),
@@ -769,6 +781,10 @@ async fn test_call_tool_response_over_100kb_is_truncated() {
     let large_body = "x".repeat(200_000);
     Mock::given(method("GET"))
         .and(path("/sale/offers"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .and(header("Authorization", "Bearer test-token"))
+        .and(header("Accept", "application/vnd.allegro.public.v1+json"))
+        .and(header("Accept-Language", "pl-PL"))
         .respond_with(ResponseTemplate::new(200).set_body_string(large_body))
         .mount(&mock_server)
         .await;
@@ -839,6 +855,7 @@ async fn test_call_tool_with_api_base_url_override_succeeds() {
 
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({ "access_token": "sandbox-token", "expires_in": 3600 })),
@@ -848,6 +865,10 @@ async fn test_call_tool_with_api_base_url_override_succeeds() {
 
     Mock::given(method("GET"))
         .and(path("/sale/offers"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .and(header("Authorization", "Bearer sandbox-token"))
+        .and(header("Accept", "application/vnd.allegro.public.v1+json"))
+        .and(header("Accept-Language", "pl-PL"))
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"sandbox":true}"#))
         .mount(&mock_server)
         .await;
@@ -918,6 +939,7 @@ async fn test_call_tool_api_4xx_returns_tool_level_error() {
     // Valid token so dispatch proceeds past auth.
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({ "access_token": "test-token", "expires_in": 3600 })),
@@ -925,9 +947,13 @@ async fn test_call_tool_api_4xx_returns_tool_level_error() {
         .mount(&mock_server)
         .await;
 
-    // API endpoint returns 404.
+    // API endpoint returns 404 — but only for fully header-compliant requests.
     Mock::given(method("GET"))
         .and(path("/sale/offers"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .and(header("Authorization", "Bearer test-token"))
+        .and(header("Accept", "application/vnd.allegro.public.v1+json"))
+        .and(header("Accept-Language", "pl-PL"))
         .respond_with(
             ResponseTemplate::new(404).set_body_string(
                 r#"{"errors":[{"code":"NotFound","message":"Resource not found"}]}"#,
@@ -1061,3 +1087,355 @@ async fn test_server_exits_cleanly_on_client_eof() {
 // by the subscriber initialised in `main`. Any future change that adds a
 // `tracing_subscriber` writing to stdout would break this invariant and
 // should be caught in code review.
+
+// ── Phase 7: User-Agent / Accept / scopes on the wire ─────────────────────────
+
+/// Builds a registry from an inline OpenAPI YAML document (operations with
+/// versioned `application/vnd.allegro.*+json` content keys, which the local
+/// fixture deliberately lacks).
+fn registry_from_yaml(yaml: &str) -> ToolRegistry {
+    let api: OpenAPI = serde_yaml::from_str(yaml).expect("parse inline schema");
+    ToolRegistry::from_openapi(&api).expect("build registry")
+}
+
+/// A config-driven custom User-Agent (config file / env / --user-agent end
+/// up here via `with_http_client`) must be sent on BOTH the OAuth token
+/// request and the API request — asserted by UA matchers on both mocks.
+#[tokio::test]
+async fn test_custom_user_agent_applies_to_token_and_api_requests() {
+    const CUSTOM_UA: &str = "MyApp/2.0.0 (+https://example.com/app)";
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .and(header("User-Agent", CUSTOM_UA))
+        .and(header("Accept-Language", "pl-PL"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "custom-ua-token", "expires_in": 3600 })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/sale/offers"))
+        .and(header("User-Agent", CUSTOM_UA))
+        .and(header("Authorization", "Bearer custom-ua-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+        .mount(&mock_server)
+        .await;
+
+    let registry = build_registry().await;
+    let tool_name = registry
+        .list_tools()
+        .iter()
+        .find(|t| t.method == "get" && t.path == "/sale/offers")
+        .expect("fixture must have GET /sale/offers tool")
+        .name
+        .clone();
+
+    let custom_client =
+        http::build_client(CUSTOM_UA, http::DEFAULT_ACCEPT_LANGUAGE).expect("valid client");
+    let auth = AllegroAuth::with_http_client(
+        "test-id".to_string(),
+        "test-secret".to_string(),
+        mock_server.uri(),
+        custom_client.clone(),
+    );
+    let handler = AllegroServer::new(registry, auth, false)
+        .with_api_base_url(mock_server.uri())
+        .with_http_client(custom_client);
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": {} }
+        }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+
+    // The request only succeeded if BOTH mocks matched — i.e. the custom UA
+    // was present on both the token and the API request.
+    assert!(
+        response["error"].is_null(),
+        "custom-UA tool call must succeed, got: {response}"
+    );
+    assert_ne!(
+        response["result"]["isError"],
+        json!(true),
+        "got: {response}"
+    );
+
+    server_handle.abort();
+}
+
+/// An operation whose schema declares `application/vnd.allegro.beta.v1+json`
+/// in `responses.'200'.content` must be dispatched with exactly that Accept
+/// header instead of the dispatcher default.
+#[tokio::test]
+async fn test_per_operation_accept_override_sent_for_get() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "beta-token", "expires_in": 3600 })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/beta/thing"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .and(header("Authorization", "Bearer beta-token"))
+        .and(header("Accept", "application/vnd.allegro.beta.v1+json"))
+        .and(header("Accept-Language", "pl-PL"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"beta":true}"#))
+        .mount(&mock_server)
+        .await;
+
+    let registry = registry_from_yaml(concat!(
+        "openapi: \"3.0.3\"\n",
+        "info:\n  title: t\n  version: v\n",
+        "paths:\n",
+        "  /beta/thing:\n",
+        "    get:\n",
+        "      operationId: getBetaThing\n",
+        "      summary: Get a beta thing\n",
+        "      responses:\n",
+        "        \"200\":\n",
+        "          description: OK\n",
+        "          content:\n",
+        "            application/vnd.allegro.beta.v1+json:\n",
+        "              schema:\n                type: object\n",
+    ));
+
+    let auth = AllegroAuth::with_base_url(
+        "test-id".to_string(),
+        "test-secret".to_string(),
+        mock_server.uri(),
+    );
+    let handler = AllegroServer::new(registry, auth, false).with_api_base_url(mock_server.uri());
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "allegro_getbetathing", "arguments": {} }
+        }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+
+    assert!(
+        response["error"].is_null(),
+        "per-op Accept tool call must succeed (mock matched), got: {response}"
+    );
+    assert_ne!(
+        response["result"]["isError"],
+        json!(true),
+        "got: {response}"
+    );
+
+    server_handle.abort();
+}
+
+/// A POST operation with a versioned `requestBody` media type must send the
+/// versioned `Content-Type` (set BEFORE `.json()`), the versioned `Accept`,
+/// and — verified on the recorded request — exactly ONE `Content-Type`
+/// header (single-header regression guard for the ordering rule).
+#[tokio::test]
+async fn test_post_carries_versioned_content_type_and_accept_single_header() {
+    const MEDIA_TYPE: &str = "application/vnd.allegro.public.v1+json";
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "post-token", "expires_in": 3600 })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/offers"))
+        .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+        .and(header("Authorization", "Bearer post-token"))
+        .and(header("Accept", MEDIA_TYPE))
+        .and(header("Content-Type", MEDIA_TYPE))
+        .respond_with(ResponseTemplate::new(201).set_body_string(r#"{"id":"offer-1"}"#))
+        .mount(&mock_server)
+        .await;
+
+    let registry = registry_from_yaml(concat!(
+        "openapi: \"3.0.3\"\n",
+        "info:\n  title: t\n  version: v\n",
+        "paths:\n",
+        "  /offers:\n",
+        "    post:\n",
+        "      operationId: createOfferVnd\n",
+        "      summary: Create an offer\n",
+        "      requestBody:\n",
+        "        required: true\n",
+        "        content:\n",
+        "          application/vnd.allegro.public.v1+json:\n",
+        "            schema:\n              type: object\n",
+        "      responses:\n",
+        "        \"201\":\n          description: Created\n",
+    ));
+
+    let auth = AllegroAuth::with_base_url(
+        "test-id".to_string(),
+        "test-secret".to_string(),
+        mock_server.uri(),
+    );
+    let handler = AllegroServer::new(registry, auth, false).with_api_base_url(mock_server.uri());
+
+    let (mut client, server_handle) = spawn_server(handler);
+    initialize(&mut client).await;
+
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "allegro_createoffervnd", "arguments": { "body": { "name": "x" } } }
+        }),
+    )
+    .await;
+    let response = recv_json(&mut client).await;
+
+    assert!(
+        response["error"].is_null(),
+        "versioned-Content-Type POST must succeed (mock matched), got: {response}"
+    );
+    assert_ne!(
+        response["result"]["isError"],
+        json!(true),
+        "got: {response}"
+    );
+
+    // Single-header guarantee: inspect the recorded API request and count
+    // its Content-Type values (`.header()` appends; `.json()` must not add a
+    // second one).
+    let requests = mock_server.received_requests().await.expect("requests");
+    let api_post = requests
+        .iter()
+        .find(|r| r.method == "POST" && r.url.path() == "/offers")
+        .expect("API POST request must have been recorded");
+    let content_types: Vec<&str> = api_post
+        .headers
+        .get_all("content-type")
+        .iter()
+        .map(|v| v.to_str().expect("ascii header value"))
+        .collect();
+    assert_eq!(
+        content_types,
+        vec![MEDIA_TYPE],
+        "exactly one versioned Content-Type header must be sent"
+    );
+
+    server_handle.abort();
+}
+
+/// Configured scopes must be sent as the space-joined OAuth2 `scope` form
+/// param on the token request; without scopes the body must stay
+/// byte-identical to the classic flow (no `scope=` at all).
+#[tokio::test]
+async fn test_token_request_carries_scope_param_only_when_configured() {
+    /// Calls any fixture tool against a fresh mock server and returns the
+    /// recorded token-request body for the given scopes.
+    async fn token_body_for(scopes: Vec<String>, tool_name: String) -> Vec<u8> {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/oauth/token"))
+            .and(header("User-Agent", http::DEFAULT_USER_AGENT))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "access_token": "scoped-token", "expires_in": 3600 })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let registry = build_registry().await;
+        let auth = AllegroAuth::with_base_url(
+            "test-id".to_string(),
+            "test-secret".to_string(),
+            mock_server.uri(),
+        )
+        .with_scopes(scopes);
+        let handler =
+            AllegroServer::new(registry, auth, false).with_api_base_url(mock_server.uri());
+
+        let (mut client, server_handle) = spawn_server(handler);
+        initialize(&mut client).await;
+        send_json(
+            &mut client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": tool_name, "arguments": {} }
+            }),
+        )
+        .await;
+        let _ = recv_json(&mut client).await;
+        server_handle.abort();
+
+        let requests = mock_server.received_requests().await.expect("requests");
+        requests
+            .iter()
+            .find(|r| r.method == "POST" && r.url.path() == "/auth/oauth/token")
+            .expect("token request must have been recorded")
+            .body
+            .to_vec()
+    }
+
+    let registry = build_registry().await;
+    let tool_name = registry
+        .list_tools()
+        .first()
+        .expect("fixture must have at least one tool")
+        .name
+        .clone();
+
+    // With scopes: `scope=` + url-encoded, space-joined value (':' → %3A).
+    let body = token_body_for(
+        vec!["allegro:api:sale:offers:read".to_owned()],
+        tool_name.clone(),
+    )
+    .await;
+    let body = String::from_utf8(body).expect("form body is ascii");
+    assert!(
+        body.contains("scope=allegro%3Aapi%3Asale%3Aoffers%3Aread"),
+        "token body must carry the url-encoded scope param, got: {body}"
+    );
+    assert!(
+        body.starts_with("grant_type=client_credentials"),
+        "grant_type stays first, got: {body}"
+    );
+
+    // Without scopes: byte-identical to the classic flow.
+    let body = token_body_for(Vec::new(), tool_name).await;
+    assert_eq!(
+        body, b"grant_type=client_credentials",
+        "empty scopes must keep the token request body byte-identical"
+    );
+}

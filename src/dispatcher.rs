@@ -8,12 +8,12 @@ use serde_json::Value;
 const MAX_BODY_BYTES: usize = 102_400;
 
 /// Returns the Allegro API base URL for the given environment.
+///
+/// Delegates to [`crate::config::api_base_url`] — the single source of truth
+/// shared with the auth-host selection, so the sandbox flag can never swap
+/// one host but not the other.
 fn allegro_api_base(sandbox: bool) -> &'static str {
-    if sandbox {
-        "https://api.allegrosandbox.pl"
-    } else {
-        "https://api.allegro.pl"
-    }
+    crate::config::api_base_url(sandbox)
 }
 
 /// Substitutes `{paramName}` segments in `path` with values from `arguments`.
@@ -131,11 +131,19 @@ pub async fn dispatch_with_base(
         remaining.remove(name);
     }
 
+    // Per-op versioned Accept when the schema declares one (see
+    // `ToolDef::accept_media_type`), the dispatcher default otherwise.
+    // `User-Agent` + `Accept-Language` come from the shared client built by
+    // `crate::http` — never set here, so every request carries them.
+    let accept = tool_def
+        .accept_media_type
+        .as_deref()
+        .unwrap_or(crate::http::DEFAULT_ACCEPT);
+
     let mut builder = http
         .request(method.clone(), &url)
         .header("Authorization", format!("Bearer {token}"))
-        .header("User-Agent", "allegro-mcp/0.1.0")
-        .header("Accept", "application/vnd.allegro.public.v1+json");
+        .header("Accept", accept);
 
     if matches!(method, reqwest::Method::GET | reqwest::Method::HEAD) {
         let pairs: Vec<(String, String)> = remaining
@@ -156,8 +164,21 @@ pub async fn dispatch_with_base(
         // operation declares a `requestBody`, so a non-GET/HEAD tool call
         // arriving with a "body" argument is always the intended request
         // payload, never an unrelated query/form field with the same name.
+        //
+        // Versioned Content-Type must be set BEFORE `.json()`: reqwest's
+        // `.header()` appends and `.json()` only fills Content-Type when it
+        // is absent, so exactly one Content-Type header is sent. Only
+        // `vnd.allegro` types (the only ones extraction can produce) are set
+        // explicitly; otherwise `.json()` applies `application/json` as today.
+        if let Some(media_type) = tool_def.accept_media_type.as_deref() {
+            builder = builder.header(reqwest::header::CONTENT_TYPE, media_type);
+        }
         builder = builder.json(&body);
     } else {
+        // Same ordering rule as above (see the requestBody branch).
+        if let Some(media_type) = tool_def.accept_media_type.as_deref() {
+            builder = builder.header(reqwest::header::CONTENT_TYPE, media_type);
+        }
         builder = builder.json(&remaining);
     }
 
@@ -266,6 +287,14 @@ mod tests {
         assert_eq!(allegro_api_base(true), "https://api.allegrosandbox.pl");
     }
 
+    /// The dispatcher's host selection must delegate to (and therefore never
+    /// diverge from) the config module's single source of truth.
+    #[test]
+    fn test_allegro_api_base_delegates_to_config_helper() {
+        assert_eq!(allegro_api_base(false), crate::config::api_base_url(false));
+        assert_eq!(allegro_api_base(true), crate::config::api_base_url(true));
+    }
+
     #[tokio::test]
     async fn test_dispatch_unsupported_method_returns_error() {
         // Auth must succeed first (dispatch fetches the token before parsing
@@ -296,6 +325,7 @@ mod tests {
             // guaranteed to be rejected by `Method::from_bytes`.
             method: "get post".to_string(),
             path: "/x".to_string(),
+            accept_media_type: None,
         };
 
         let result = dispatch(&auth, &http, false, &tool_def, serde_json::Map::new()).await;
@@ -400,6 +430,7 @@ mod tests {
             input_schema: serde_json::json!({}),
             method: "get".to_string(),
             path: "/sale/offers".to_string(),
+            accept_media_type: None,
         };
 
         let result = dispatch(&auth, &http, false, &tool_def, serde_json::Map::new()).await;
@@ -435,6 +466,7 @@ mod tests {
             input_schema: serde_json::json!({}),
             method: "get".to_string(),
             path: "/sale/offers".to_string(),
+            accept_media_type: None,
         };
 
         let result = dispatch(&auth, &http, true, &tool_def, serde_json::Map::new()).await;

@@ -48,13 +48,29 @@ pub struct SchemaStats {
     pub sha256: String,
 }
 
-/// Load the schema from the given source.
-/// Returns the parsed OpenAPI document and the raw YAML bytes.
-/// On URL fetch failure, falls back to the cached copy if available.
+/// Load the schema from the given source using the default (ToS-compliant
+/// UA) schema client — a backward-compat wrapper over [`load_with_client`]
+/// for existing callers and tests. Production paths pass the config-driven
+/// client built in `main`.
+///
+/// Returns the parsed OpenAPI document and the raw YAML bytes. On URL fetch
+/// failure, falls back to the cached copy if available.
+#[allow(dead_code)]
 pub async fn load(source: &SchemaSource) -> Result<(OpenAPI, Vec<u8>), SchemaError> {
+    load_with_client(&crate::http::default_schema_client(), source).await
+}
+
+/// Like [`load`] but routes URL fetches through the provided client (built
+/// via [`crate::http::build_schema_client`] in `main`), so a config-driven
+/// User-Agent applies to schema downloads from Allegro hosts too. `File`
+/// sources never touch the network.
+pub async fn load_with_client(
+    http: &reqwest::Client,
+    source: &SchemaSource,
+) -> Result<(OpenAPI, Vec<u8>), SchemaError> {
     let bytes = match source {
         SchemaSource::File(path) => std::fs::read(path)?,
-        SchemaSource::Url(url) => match fetch::fetch_bytes(url).await {
+        SchemaSource::Url(url) => match fetch::fetch_bytes_with_client(http, url).await {
             Ok(b) => {
                 if cache::detect_drift(&b) {
                     tracing::warn!("upstream schema has drifted from cached version");

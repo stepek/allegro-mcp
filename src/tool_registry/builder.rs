@@ -60,6 +60,14 @@ fn build_one_tool(
         operation.request_body.as_ref(),
     )?;
 
+    // 6. Per-op versioned Accept media type from OpenAPI `content` keys
+    //    (None → dispatcher default).
+    let accept_media_type = crate::tool_registry::schema_builder::extract_accept_media_type(
+        api,
+        operation.request_body.as_ref(),
+        &operation.responses,
+    );
+
     Ok(ToolDef {
         id: id.clone(),
         name: id,
@@ -67,6 +75,7 @@ fn build_one_tool(
         input_schema,
         method: method.to_string(),
         path: path_str.to_string(),
+        accept_media_type,
     })
 }
 
@@ -221,6 +230,68 @@ mod tests {
             tools.len(),
             0,
             "$ref path item must be skipped and contribute 0 tools, got: {tools:?}"
+        );
+    }
+
+    // ── accept_media_type populated from content keys ─────────────────────────
+
+    #[test]
+    fn build_one_tool_populates_accept_media_type_from_vnd_keys() {
+        let api: openapiv3::OpenAPI = serde_yaml::from_str(concat!(
+            "openapi: \"3.0.3\"\n",
+            "info:\n  title: t\n  version: v\n",
+            "paths:\n",
+            "  /offers:\n",
+            "    post:\n",
+            "      operationId: createOffer\n",
+            "      requestBody:\n",
+            "        content:\n",
+            "          application/vnd.allegro.public.v1+json:\n",
+            "            schema:\n              type: object\n",
+            "      responses:\n",
+            "        \"201\":\n          description: Created\n",
+            "  /beta:\n",
+            "    get:\n",
+            "      operationId: getBeta\n",
+            "      responses:\n",
+            "        \"200\":\n",
+            "          description: OK\n",
+            "          content:\n",
+            "            application/vnd.allegro.beta.v1+json:\n",
+            "              schema:\n                type: object\n",
+            "  /plain:\n",
+            "    get:\n",
+            "      operationId: getPlain\n",
+            "      responses:\n",
+            "        \"200\":\n",
+            "          description: OK\n",
+            "          content:\n",
+            "            application/json:\n",
+            "              schema:\n                type: object\n",
+        ))
+        .unwrap();
+        let tools = build_tools(&api).unwrap();
+        let find = |id: &str| {
+            tools
+                .iter()
+                .find(|t| t.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+        };
+
+        assert_eq!(
+            find("allegro_createoffer").accept_media_type.as_deref(),
+            Some("application/vnd.allegro.public.v1+json"),
+            "requestBody vnd key must populate accept_media_type"
+        );
+        assert_eq!(
+            find("allegro_getbeta").accept_media_type.as_deref(),
+            Some("application/vnd.allegro.beta.v1+json"),
+            "response vnd key must populate accept_media_type"
+        );
+        assert_eq!(
+            find("allegro_getplain").accept_media_type,
+            None,
+            "plain application/json must leave accept_media_type None (default Accept)"
         );
     }
 }
