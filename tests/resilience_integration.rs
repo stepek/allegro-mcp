@@ -250,6 +250,10 @@ async fn dispatch_network_error_unreachable_message() {
     .map_err(|e| e.report())
     .expect_err("an unreachable API must fail");
     assert!(
+        err.contains("Allegro unreachable"),
+        "the report header must name the failure mode (ticket wording), got: {err}"
+    );
+    assert!(
         err.contains("could not be reached"),
         "user-facing reachability copy, got: {err}"
     );

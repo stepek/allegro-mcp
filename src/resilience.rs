@@ -1018,8 +1018,40 @@ mod tests {
             source_text: "error sending request".to_owned(),
         }
         .report();
+        assert!(report.contains("Allegro unreachable"), "{report}");
         assert!(report.contains("could not be reached"), "{report}");
         assert!(report.contains("error sending request"), "{report}");
+    }
+
+    /// Hostile huge bodies (proxy error pages, binary garbage) must never
+    /// balloon the report: the Dev line caps at 4 KB, and the cut must land
+    /// on a UTF-8 char boundary even when a multi-byte char straddles it.
+    #[test]
+    fn report_truncates_huge_dev_bodies() {
+        let mut body = "x".repeat(DEV_BODY_MAX_BYTES - 1);
+        // A 3-byte char occupying bytes [4095, 4098) — byte 4096 is NOT a
+        // char boundary, so the truncation helper must walk back.
+        body.push('€');
+        body.push_str(&"tail-marker-never-rendered".repeat(64));
+
+        let report = DispatchError::Client {
+            status: 502,
+            trace_id: Some("tr-huge".to_owned()),
+            allegro: None,
+            body,
+        }
+        .report();
+        assert!(
+            report.len() < DEV_BODY_MAX_BYTES + 1024,
+            "the report must stay bounded (Dev line capped at {DEV_BODY_MAX_BYTES} bytes \
+             + short header/user lines), got {} bytes",
+            report.len()
+        );
+        assert!(
+            !report.contains("tail-marker-never-rendered"),
+            "everything past the 4 KB cap must be cut"
+        );
+        assert!(report.contains("Trace-Id: tr-huge"), "{report}");
     }
 
     // ── Rate budget ─────────────────────────────────────────────────────────
@@ -1068,6 +1100,26 @@ mod tests {
         let mut last2 = 59u64;
         advance(&mut b2, &mut last2, 60);
         assert_eq!(window_total(&b2), 0, "crossing the minute boundary resets");
+    }
+
+    /// The config contract "0 disables the guard" end-to-end at the wiring
+    /// layer: `production(0)` must produce NO budget handle (the
+    /// dispatcher's acquire step is skipped entirely), while any positive
+    /// cap wires the shared budget the server clones share.
+    #[test]
+    fn production_rate_limit_zero_disables_the_budget() {
+        assert!(
+            Resilience::production(0).budget.is_none(),
+            "rate_limit_per_minute = 0 must disable the client-side guard"
+        );
+        assert!(
+            Resilience::production(8000).budget.is_some(),
+            "a positive cap must wire the shared budget"
+        );
+        // Unguarded (legacy wrappers) and test-instant bundles never carry
+        // a budget — only the production constructor wires one.
+        assert!(Resilience::unguarded().budget.is_none());
+        assert!(Resilience::test_instant().budget.is_none());
     }
 
     // ── is_idempotent ───────────────────────────────────────────────────────
