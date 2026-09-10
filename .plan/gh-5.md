@@ -221,9 +221,9 @@ harden it too — see Phase 3).
 
 ---
 
-## Phase 1: `src/config.rs` — PENDING
+## Phase 1: `src/config.rs` — DONE
 
-- [ ] 1.1 Extend the enum:
+- [x] 1.1 Extend the enum:
   ```rust
   #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
   #[serde(rename_all = "snake_case")]
@@ -235,28 +235,28 @@ harden it too — see Phase 3).
   ```
   The serde error for unknown values automatically lists both supported
   variants (message still contains `client_credentials`).
-- [ ] 1.2 Update `token_path` doc comment: consumed by the device flow;
+- [x] 1.2 Update `token_path` doc comment: consumed by the device flow;
   default `dirs::config_dir()/allegro-mcp/tokens.json`; relative paths are
   CWD-relative (document).
-- [ ] 1.3 `apply_env`: read `ALLEGRO_MCP_TOKEN_PATH` → `cfg.token_path =
+- [x] 1.3 `apply_env`: read `ALLEGRO_MCP_TOKEN_PATH` → `cfg.token_path =
   Some(PathBuf::from(v))` (non-empty, trimmed; empty string is ignored —
   same hygiene as `ALLEGRO_MCP_CONFIG` in `discover_path`).
-- [ ] 1.4 **Fix the existing test** `from_toml_str_unknown_auth_flow_errors_
+- [x] 1.4 **Fix the existing test** `from_toml_str_unknown_auth_flow_errors_
   listing_supported_values` (config.rs:760): change the unknown fixture from
   `"device_code"` to `"authorization_code"`; additionally assert the message
   contains both `client_credentials` and `device_code`.
-- [ ] 1.5 New tests: `from_toml_str_device_code_flow_parses`;
+- [x] 1.5 New tests: `from_toml_str_device_code_flow_parses`;
   `apply_env_token_path_override` (`#[serial]`, reuse the `with_env`
   helper); `apply_env_token_path_empty_ignored`.
-- [ ] 1.6 Commit: `feat(config): accept auth_flow = "device_code", consume token_path (#5)`
+- [x] 1.6 Commit: `feat(config): accept auth_flow = "device_code", consume token_path (#5)`
 
-## Phase 2: `src/auth/token_store.rs` — PENDING
+## Phase 2: `src/auth/token_store.rs` — DONE
 
 Declare in `src/auth/mod.rs`: `pub mod device; pub mod token_store;`
 (added in Phase 3; create the store file first so Phase 2 lands compiles as
 part of the same commit — or add the `mod` lines immediately).
 
-- [ ] 2.1 Types (all `serde::Serialize + Deserialize`, `#[serde(default)]`
+- [x] 2.1 Types (all `serde::Serialize + Deserialize`, `#[serde(default)]`
   on the envelope, **no** `deny_unknown_fields` — the file is
   machine-written and forward compatibility is handled by `version`):
   ```rust
@@ -287,7 +287,7 @@ part of the same commit — or add the `mod` lines immediately).
   ```
   `"env"` is `"production" | "sandbox"` — tokens are **not** interchangeable
   between environments (docs + config.rs module doc); mismatch ⇒ hard error.
-- [ ] 2.2 `TokenStore`:
+- [x] 2.2 `TokenStore`:
   ```rust
   pub struct TokenStore { path: PathBuf, sandbox: bool }
   impl TokenStore {
@@ -304,7 +304,7 @@ part of the same commit — or add the `mod` lines immediately).
   `save_tokens` writes **only** `tokens` (dropping any stale `pending`) in
   one atomic write — grant completion and pending-clearance are the same
   operation, no torn state. `clear_pending` preserves `tokens`.
-- [ ] 2.3 Atomic write helper `fn write_atomic(path: &Path, bytes: &[u8]) ->
+- [x] 2.3 Atomic write helper `fn write_atomic(path: &Path, bytes: &[u8]) ->
   io::Result<()>`:
   1. `create_dir_all(parent)`; on unix best-effort `set_permissions(0o700)`
      on the created allegro-mcp dir only when we created it (track via
@@ -317,24 +317,24 @@ part of the same commit — or add the `mod` lines immediately).
   5. best-effort parent-dir `sync_all` (ignore errors).
   On `#[cfg(not(unix))]` skip `.mode()` (Windows ACLs apply; noted in Risks).
   Clean up the temp file on any error path (best-effort `remove_file`).
-- [ ] 2.4 Load semantics: missing file → `Ok(StoredState::default())`;
+- [x] 2.4 Load semantics: missing file → `Ok(StoredState::default())`;
   `version != 1` → `AuthError::StoreVersion { found }` ("written by a newer
   allegro-mcp — delete the file or upgrade"); `env` mismatch →
   `AuthError::EnvMismatch { stored, current }`; unparsable JSON →
   `AuthError::StoreIo` carrying the path. **Never auto-delete** a corrupt
   file — surface it (`auth device` overwrites on success anyway).
-- [ ] 2.5 Unit tests (`#[cfg(test)]`, tempdir-based):
+- [x] 2.5 Unit tests (`#[cfg(test)]`, tempdir-based):
   round-trip save/load; missing file → default; corrupt JSON → error naming
   path; `version: 2` → `StoreVersion`; sandbox/prod mismatch →
   `EnvMismatch`; no `.tmp-*` leftovers after save; **perms test**
   (`#[cfg(unix)]`): file mode `& 0o777 == 0o600`, parent dir `0o700` when
   created; `save_tokens` drops pending; `clear_pending` keeps tokens;
   `clear` removes the file.
-- [ ] 2.6 Commit: `feat(auth): versioned on-disk token store with atomic 0600 writes (#5)`
+- [x] 2.6 Commit: `feat(auth): versioned on-disk token store with atomic 0600 writes (#5)`
 
-## Phase 3: `src/auth/device.rs` — PENDING
+## Phase 3: `src/auth/device.rs` — DONE
 
-- [ ] 3.1 Response type with lenient numerics (§0.5):
+- [x] 3.1 Response type with lenient numerics (§0.5):
   ```rust
   #[derive(Debug, Clone, serde::Deserialize)]
   pub struct DeviceAuthorizationResponse {
@@ -350,7 +350,7 @@ part of the same commit — or add the `mod` lines immediately).
   `Number(as_u64)` and numeric `String::parse`. Harden the existing token
   response's `expires_in` the same way (in `mod.rs`) — one helper, used
   twice.
-- [ ] 3.2 Poll outcome + terminal taxonomy (ticket + §0.2):
+- [x] 3.2 Poll outcome + terminal taxonomy (ticket + §0.2):
   ```rust
   pub enum PollOutcome {
       Token(TokenResponse),     // 200
@@ -373,7 +373,7 @@ part of the same commit — or add the `mod` lines immediately).
   parse `{"error": ...}` with `serde_json`; `"Invalid device code"` matched
   case-insensitively as substring (docs show it verbatim); unknown 4xx
   error strings → `ExpiredOrInvalid` with the raw code surfaced in logs.
-- [ ] 3.3 Poll state machine (pure):
+- [x] 3.3 Poll state machine (pure):
   ```rust
   pub struct PollState { interval: Duration, deadline: Instant, transient_errors: u32 }
   impl PollState {
@@ -387,7 +387,7 @@ part of the same commit — or add the `mod` lines immediately).
   Unit tests: pending keeps interval; slow_down adds exactly +1 s (twice in
   a row → +2 s); access_denied/expired break immediately; transient × 5
   breaks; deadline check boundary.
-- [ ] 3.4 `request_device_code(deps: &DeviceFlowDeps) -> Result<Device
+- [x] 3.4 `request_device_code(deps: &DeviceFlowDeps) -> Result<Device
   AuthorizationResponse, AuthError>`:
   `POST {auth_base_url}/auth/oauth/device`, `.basic_auth(id, Some(secret))`,
   `.form(&[("client_id", id)] (+ ("scope", space-joined) when scopes
@@ -397,7 +397,7 @@ part of the same commit — or add the `mod` lines immediately).
   interval_override: Option<Duration> }` and
   `PollingPolicy::production()` (`None`) / `PollingPolicy::test_instant()`
   (`Some(Duration::ZERO)`) so wiremock tests don't real-sleep.
-- [ ] 3.5 `poll_for_token(deps, device_code: &str, state: PollState) ->
+- [x] 3.5 `poll_for_token(deps, device_code: &str, state: PollState) ->
   Result<TokenResponse, DeviceFlowError>`:
   loop `{ if deadline_exceeded → Err(Expired); tokio::time::sleep(interval);
   POST /auth/oauth/token form [("grant_type",
@@ -405,7 +405,7 @@ part of the same commit — or add the `mod` lines immediately).
   Basic auth; classify; advance; Token → return }`. Uses
   `tokio::time::sleep` (pausable in tests); never `error_for_status` before
   body read (400 bodies carry the taxonomy).
-- [ ] 3.6 User-facing banner (pure fn, reused by CLI and server):
+- [x] 3.6 User-facing banner (pure fn, reused by CLI and server):
   ```rust
   pub fn format_user_code(code: &str) -> String;   // "cbt3zdu4g" → "cbt 3zd u4g" (char-based groups of 3)
   pub fn banner_text(resp: &DeviceAuthorizationResponse, sandbox: bool, resumed: bool) -> String;
@@ -414,19 +414,19 @@ part of the same commit — or add the `mod` lines immediately).
   `verification_uri` + grouped `user_code` as the fallback, the expiry, and
   "waiting/polling every {interval} s"; `resumed=true` adds "resuming your
   earlier device authorization". Never logs `device_code`.
-- [ ] 3.7 Unit tests: parse numeric AND string `expires_in`/`interval`;
+- [x] 3.7 Unit tests: parse numeric AND string `expires_in`/`interval`;
   missing `verification_uri_complete` tolerated; classify matrix (§0.2
   table — all five responses + unknown 4xx + 500 + garbage body);
   `format_user_code` grouping incl. non-3-multiple length; banner contains
   the complete URI and never the device_code.
-- [ ] 3.8 Commit: `feat(auth): device authorization request + polling state machine (#5)`
+- [x] 3.8 Commit: `feat(auth): device authorization request + polling state machine (#5)`
 
-## Phase 4: `src/auth/mod.rs` — device mode + refresh grant — PENDING
+## Phase 4: `src/auth/mod.rs` — device mode + refresh grant — DONE
 
-- [ ] 4.1 `TokenResponse` += `pub token_type: Option<String>` and
+- [x] 4.1 `TokenResponse` += `pub token_type: Option<String>` and
   `pub refresh_token: Option<String>` (existing test JSON has neither →
   still parses; `expires_in` gets the `u64_lenient` treatment from 3.1).
-- [ ] 4.2 `AuthError` additions:
+- [x] 4.2 `AuthError` additions:
   ```rust
   #[error("re-authorization required: {reason} — run `allegro-mcp auth device`")]
   ReauthRequired { reason: String },
@@ -440,7 +440,7 @@ part of the same commit — or add the `mod` lines immediately).
   `DeviceFlowError`, which converts into `AuthError::DeviceFlow`-ish via
   `ReauthRequired`/display — keep one public error surface; map
   `DeviceFlowError` → `anyhow` at the CLI boundary).
-- [ ] 4.3 Flow wiring:
+- [x] 4.3 Flow wiring:
   ```rust
   #[derive(Clone, Copy, Debug, PartialEq)]
   enum FlowMode { ClientCredentials, Device }
@@ -450,7 +450,7 @@ part of the same commit — or add the `mod` lines immediately).
   ```
   Existing constructors default to `ClientCredentials`/`None` — every
   existing test call site is untouched.
-- [ ] 4.4 Device-mode `token()` resolution chain (inside the existing
+- [x] 4.4 Device-mode `token()` resolution chain (inside the existing
   double-checked write-lock slow path, preserving single-flight):
   1. in-memory cache valid → return (unchanged);
   2. `store.load()`: `tokens` present && access token unexpired
@@ -465,7 +465,7 @@ part of the same commit — or add the `mod` lines immediately).
   4. else → `Err(ReauthRequired { reason: "no stored device authorization" })`.
   Cache entries for device mode use the stored/refreshed `expires_in` with
   the existing 120 s clamp.
-- [ ] 4.5 Refresh grant:
+- [x] 4.5 Refresh grant:
   `POST /auth/oauth/token` form `[("grant_type", "refresh_token"),
   ("refresh_token", rt)]` Basic auth (no `scope` param — docs don't send
   one; response carries the scope). **Persist the rotated pair BEFORE
@@ -473,7 +473,7 @@ part of the same commit — or add the `mod` lines immediately).
   `400 invalid_grant` / `"Invalid"`-style rejection after the stale-store
   guard → `store.clear()` + `Err(ReauthRequired { reason: "refresh token
   rejected — authorization was revoked or expired" })`.
-- [ ] 4.6 New public methods:
+- [x] 4.6 New public methods:
   - `pub async fn invalidate(&self)` — drop the in-memory cache (both modes);
   - `pub async fn install_tokens(&self, resp: &TokenResponse) -> Result<(),
     AuthError>` — device mode only: `store.save_tokens(resp, …)` then seed
@@ -481,10 +481,10 @@ part of the same commit — or add the `mod` lines immediately).
   - `pub async fn refresh_now(&self) -> Result<(), AuthError>` — clear
     cache then run the device-mode refresh path (or plain refetch in
     client_credentials mode); used by the dispatcher's 401 retry.
-- [ ] 4.7 `status()`: `auth_flow` becomes `self.flow_label()`; add
+- [x] 4.7 `status()`: `auth_flow` becomes `self.flow_label()`; add
   `pub persisted: bool` (device mode: store reported `tokens`; client_
   credentials: always `false`) — additive field, serde adds the key.
-- [ ] 4.8 Unit tests: refresh triggered only when access expired (seed
+- [x] 4.8 Unit tests: refresh triggered only when access expired (seed
   store with live access → no network; with expired access + refresh →
   refresh called); rotation persisted (store updated with the NEW refresh
   token, old one never reused); refresh rejection → `ReauthRequired` +
@@ -495,30 +495,30 @@ part of the same commit — or add the `mod` lines immediately).
   precedence logic is testable by injecting a store seeded in a tempdir and
   pointing `with_base_url` at a wiremock (integration) — keep unit tests to
   label/mode/cache-seeding.
-- [ ] 4.9 Commit: `feat(auth): device-mode token resolution + single-use refresh rotation (#5)`
+- [x] 4.9 Commit: `feat(auth): device-mode token resolution + single-use refresh rotation (#5)`
 
-## Phase 5: `src/dispatcher.rs` — 401 auto-refresh retry — PENDING
+## Phase 5: `src/dispatcher.rs` — 401 auto-refresh retry — DONE
 
-- [ ] 5.1 Restructure `dispatch_with_base`: hoist method/url/params/accept
+- [x] 5.1 Restructure `dispatch_with_base`: hoist method/url/params/accept
   computation above a local closure `let build = |token: &str| builder…`;
   send once; if `status == StatusCode::UNAUTHORIZED`:
   `auth.invalidate().await` → `auth.token().await` → rebuild → retry
   **once**. If the retry also fails, return the retry's error (the original
   401 body is less interesting than the post-refresh one). Non-401 errors
   behave exactly as today.
-- [ ] 5.2 Rationale comment: device tokens are user-scoped and die
+- [x] 5.2 Rationale comment: device tokens are user-scoped and die
   out-of-band (password change, app unlink, 20-session cap — §0.3); the
   60 s pre-expiry refresh cannot see those, so the 401 hook is the only
   recovery path short of full re-auth.
-- [ ] 5.3 Unit tests (wiremock, mirroring the existing `test_dispatch_*`
+- [x] 5.3 Unit tests (wiremock, mirroring the existing `test_dispatch_*`
   style): API mock returns 401 then 200 → `Ok`, and the mock saw 2 API
   hits; API always 401 → `Err` containing the second body; auth failure on
   the re-resolve → `Err` with `auth error` prefix.
-- [ ] 5.4 Commit: `feat(dispatcher): single 401 retry with token re-resolution (#5)`
+- [x] 5.4 Commit: `feat(dispatcher): single 401 retry with token re-resolution (#5)`
 
-## Phase 6: `src/main.rs` + `src/http_server.rs` — CLI + server wiring — PENDING
+## Phase 6: `src/main.rs` + `src/http_server.rs` — CLI + server wiring — DONE
 
-- [ ] 6.1 CLI:
+- [x] 6.1 CLI:
   ```rust
   enum Commands { Schema { .. }, Tools { .. }, Auth { action: AuthAction }, Healthcheck }
   enum AuthAction {
@@ -534,7 +534,7 @@ part of the same commit — or add the `mod` lines immediately).
   currently only accepts args *before* the subcommand). Verify the three
   existing parse tests still pass and add
   `auth_device_subcommand_parses` / `auth_device_token_path_flag_parses`.
-- [ ] 6.2 `async fn run_auth_device(cfg: config::Config, api_client:
+- [x] 6.2 `async fn run_auth_device(cfg: config::Config, api_client:
   reqwest::Client, token_path_override: Option<PathBuf>) -> Result<()>`:
   1. read `ALLEGRO_CLIENT_ID` / `ALLEGRO_CLIENT_SECRET` (same mapping as
      `build_allegro_server`);
@@ -553,11 +553,11 @@ part of the same commit — or add the `mod` lines immediately).
      `anyhow::bail!`.
   No Ctrl-C handler — SIGINT kill is fine, persistence covers resume (that
   is acceptance criterion 2).
-- [ ] 6.3 Dispatch in `main()`: `Some(Commands::Auth { action:
+- [x] 6.3 Dispatch in `main()`: `Some(Commands::Auth { action:
   AuthAction::Device { token_path } }) => run_auth_device(cfg,
   api_client, token_path).await` (after config load, before any schema
   work — `auth device` must not require the OpenAPI schema).
-- [ ] 6.4 Device branch in `build_allegro_server()`:
+- [x] 6.4 Device branch in `build_allegro_server()`:
   ```rust
   let auth = match cfg.auth_flow {
       config::AuthFlow::ClientCredentials => { /* current code */ }
@@ -581,18 +581,18 @@ part of the same commit — or add the `mod` lines immediately).
   - `Err(ReauthRequired)` with nothing usable → `anyhow::bail!("no Allegro
     authorization found — run `allegro-mcp auth device` first")` (startup
     fails loudly; docker logs carry the instruction).
-- [ ] 6.5 `src/http_server.rs`: replace the eager-check banner/discrepancy
+- [x] 6.5 `src/http_server.rs`: replace the eager-check banner/discrepancy
   block (lines ~102-123): keep the hard-fail for client_credentials; for
   device mode (`auth.flow_label() == "device_code"`) a pending grant must
   not abort startup — use `auth.status().await` (token_cached/token_valid)
   instead of a bare `token().await` for the decision, and adjust the banner
   text per flow ("client_credentials check OK" vs "device authorization
   active/restored"). Delete the "no device-flow exists" comment.
-- [ ] 6.6 Commit: `feat(cli): allegro-mcp auth device + server-side device-mode wiring (#5)`
+- [x] 6.6 Commit: `feat(cli): allegro-mcp auth device + server-side device-mode wiring (#5)`
 
-## Phase 7: integration tests + docs — PENDING
+## Phase 7: integration tests + docs — DONE
 
-- [ ] 7.1 `tests/device_flow_integration.rs` (wiremock; tempdir token path;
+- [x] 7.1 `tests/device_flow_integration.rs` (wiremock; tempdir token path;
   `PollingPolicy::test_instant()`; construct `AllegroAuth::with_base_url(..)
   .with_token_store(TokenStore::new(tmp, false))`):
   - `device_flow_happy_path_persists_tokens` — device endpoint 200 →
@@ -616,15 +616,15 @@ part of the same commit — or add the `mod` lines immediately).
     invalid_grant → `ReauthRequired`, store cleared;
   - `dispatcher_retries_once_on_401` — token endpoint + API 401-once →
     dispatch succeeds, API hit twice.
-- [ ] 7.2 Check `tests/config_integration.rs` (and grep the whole `tests/`
+- [x] 7.2 Check `tests/config_integration.rs` (and grep the whole `tests/`
   tree) for a `device_code`-rejection assertion and update it to the
   acceptance case.
-- [ ] 7.3 Docs: README — short "headless login: `allegro-mcp auth device`"
+- [x] 7.3 Docs: README — short "headless login: `allegro-mcp auth device`"
   section incl. the device-type app registration requirement (§0.4);
   SECURITY.md:26 — replace "token_path reserved" with the actual
   0600/atomic/rotation story; docs/open-webui.md `/auth/status` sample may
   gain a device-mode example (optional).
-- [ ] 7.4 Commit: `test(auth): wiremock device-flow integration suite; docs (#5)`
+- [x] 7.4 Commit: `test(auth): wiremock device-flow integration suite; docs (#5)`
 
 ---
 

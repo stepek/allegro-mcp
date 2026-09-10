@@ -99,26 +99,50 @@ pub async fn run_http_server(
 
     let auth_handle = handler.auth_handle();
 
-    // See the module doc's "Discrepancy" note in the plan: no device-flow
-    // exists, so this eager fetch + banner is the closest honest
-    // equivalent to "first-run auth UX" — a broken client_id/secret pair
-    // is caught at startup (visible in `docker logs`) instead of silently
-    // failing on the first tool call from Open WebUI.
-    match auth_handle.token().await {
-        Ok(_) => info!(
-            "=================================================================\n \
-             allegro-mcp: Allegro OAuth2 client_credentials check OK (sandbox={})\n \
-             ================================================================",
-            sandbox
-        ),
-        Err(e) => {
-            error!(
+    // Flow-aware startup check:
+    // - `client_credentials`: eager token fetch + banner — a broken
+    //   client_id/secret pair is caught at startup (visible in `docker
+    //   logs`) instead of silently failing on the first tool call from
+    //   Open WebUI.
+    // - `device_code`: a not-yet-completed user authorization must NOT
+    //   abort startup — `main.rs::build_allegro_server` may have spawned a
+    //   background resume poll for a pending grant. The decision therefore
+    //   uses the read-only `status()` snapshot, never a bare `token()`
+    //   (which would error while the poll is still in flight).
+    if auth_handle.flow_label() == "device_code" {
+        let status = auth_handle.status().await;
+        if status.token_valid {
+            info!(
                 "=================================================================\n \
-                 allegro-mcp: STARTUP AUTH CHECK FAILED: {e}\n \
-                 Check ALLEGRO_CLIENT_ID / ALLEGRO_CLIENT_SECRET and retry.\n \
-                 =================================================================",
+                 allegro-mcp: device authorization restored/active (sandbox={sandbox})\n \
+                 ================================================================"
             );
-            anyhow::bail!("startup Allegro auth check failed: {e}");
+        } else {
+            warn!(
+                "=================================================================\n \
+                 allegro-mcp: device authorization pending — a background poll is waiting \
+                 for you to approve the request (sandbox={sandbox}); tool calls return an \
+                 auth error until then. If the code expired, run `allegro-mcp auth device`.\n \
+                 ================================================================"
+            );
+        }
+    } else {
+        match auth_handle.token().await {
+            Ok(_) => info!(
+                "=================================================================\n \
+                 allegro-mcp: Allegro OAuth2 client_credentials check OK (sandbox={})\n \
+                 ================================================================",
+                sandbox
+            ),
+            Err(e) => {
+                error!(
+                    "=================================================================\n \
+                     allegro-mcp: STARTUP AUTH CHECK FAILED: {e}\n \
+                     Check ALLEGRO_CLIENT_ID / ALLEGRO_CLIENT_SECRET and retry.\n \
+                     =================================================================",
+                );
+                anyhow::bail!("startup Allegro auth check failed: {e}");
+            }
         }
     }
 

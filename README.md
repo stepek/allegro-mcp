@@ -68,6 +68,46 @@ exposing the port beyond a private network.
 `GET /health` (unauthenticated) and `GET /auth/status` (admin visibility
 into the Allegro token cache) are also served alongside `/mcp`.
 
+## Headless login: `allegro-mcp auth device`
+
+For **user-scoped** access (your own account's data — offers, orders,
+bills), allegro-mcp supports the OAuth2 **device flow**
+(`auth_flow = "device_code"` in `allegro-mcp.toml`):
+
+```bash
+export ALLEGRO_CLIENT_ID=... ALLEGRO_CLIENT_SECRET=...
+allegro-mcp --sandbox auth device        # production: drop --sandbox
+```
+
+The command prints a verification link (the user code is pre-filled) to
+**stderr**, polls in the background, and — once you approve in the browser —
+persists the token pair atomically (`0600`) to
+`~/.config/allegro-mcp/tokens.json` (override with `token_path` in the
+config, `ALLEGRO_MCP_TOKEN_PATH`, or `--token-path`). The server then
+restores and auto-refreshes those tokens; a single-use refresh token is
+rotated on every refresh and persisted *before* the cache is touched.
+
+Re-running the command is safe: if a previous run was killed mid-poll, the
+still-valid pending grant is resumed instead of asking for a fresh
+authorization.
+
+> ⚠️ **Device flow requires a device-type app registration.** When creating
+> the app at [apps.developer.allegro.pl](https://apps.developer.allegro.pl),
+> choose *"Aplikacja będzie działać w środowisku bez dostępu do
+> przeglądarki…"* ("the application will run in an environment without
+> browser access"). An app's type **cannot** be changed after registration —
+> a browser-based (`client_credentials`/`authorization_code`) registration
+> cannot run the device flow.
+
+Serving with `auth_flow = "device_code"`: startup restores the persisted
+tokens; if a pending grant exists it prints the banner to stderr/docker
+logs and completes the authorization in the background; with nothing stored
+it refuses to start and points at `allegro-mcp auth device`.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `ALLEGRO_MCP_TOKEN_PATH` | Overrides where device-flow tokens are persisted (beats `token_path` in the config) | unset |
+
 ## Key design decisions
 
 | # | Decision | Why |

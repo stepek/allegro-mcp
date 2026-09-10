@@ -75,6 +75,23 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
+/// Sets the versioned `Content-Type` when the schema declares one, before
+/// `.json()` runs.
+///
+/// Ordering rule: reqwest's `.header()` appends and `.json()` only fills
+/// Content-Type when it is absent, so exactly one Content-Type header is
+/// sent. Only `vnd.allegro` types (the only ones extraction can produce) are
+/// set explicitly; otherwise `.json()` applies `application/json` as today.
+fn with_versioned_content_type(
+    builder: reqwest::RequestBuilder,
+    tool_def: &crate::tool_registry::ToolDef,
+) -> reqwest::RequestBuilder {
+    match tool_def.accept_media_type.as_deref() {
+        Some(media_type) => builder.header(reqwest::header::CONTENT_TYPE, media_type),
+        None => builder,
+    }
+}
+
 /// Truncates `body` to at most [`MAX_BODY_BYTES`] bytes at a UTF-8 char
 /// boundary, appending `"\n[truncated]"` if truncation occurred.
 fn truncate_body(body: String) -> String {
@@ -140,12 +157,15 @@ pub async fn dispatch_with_base(
         .as_deref()
         .unwrap_or(crate::http::DEFAULT_ACCEPT);
 
-    let mut builder = http
-        .request(method.clone(), &url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", accept);
-
-    if matches!(method, reqwest::Method::GET | reqwest::Method::HEAD) {
+    // The request "plan" is computed once so the 401 retry below can rebuild
+    // the request from identical inputs (`remaining` is consumed while
+    // shaping the body; the plan freezes the result).
+    enum Plan {
+        Query(Vec<(String, String)>),
+        ReservedBody(Value),
+        JsonMap(serde_json::Map<String, Value>),
+    }
+    let plan = if matches!(method, reqwest::Method::GET | reqwest::Method::HEAD) {
         let pairs: Vec<(String, String)> = remaining
             .into_iter()
             .map(|(k, v)| {
@@ -156,7 +176,7 @@ pub async fn dispatch_with_base(
                 (k, value_str)
             })
             .collect();
-        builder = builder.query(&pairs);
+        Plan::Query(pairs)
     } else if let Some(body) = remaining.remove("body") {
         // CONVENTION: "body" key is reserved for requestBody content; set by
         // schema_builder.rs. `schema_builder::build_input_schema` only adds a
@@ -164,28 +184,45 @@ pub async fn dispatch_with_base(
         // operation declares a `requestBody`, so a non-GET/HEAD tool call
         // arriving with a "body" argument is always the intended request
         // payload, never an unrelated query/form field with the same name.
-        //
-        // Versioned Content-Type must be set BEFORE `.json()`: reqwest's
-        // `.header()` appends and `.json()` only fills Content-Type when it
-        // is absent, so exactly one Content-Type header is sent. Only
-        // `vnd.allegro` types (the only ones extraction can produce) are set
-        // explicitly; otherwise `.json()` applies `application/json` as today.
-        if let Some(media_type) = tool_def.accept_media_type.as_deref() {
-            builder = builder.header(reqwest::header::CONTENT_TYPE, media_type);
-        }
-        builder = builder.json(&body);
+        Plan::ReservedBody(body)
     } else {
-        // Same ordering rule as above (see the requestBody branch).
-        if let Some(media_type) = tool_def.accept_media_type.as_deref() {
-            builder = builder.header(reqwest::header::CONTENT_TYPE, media_type);
-        }
-        builder = builder.json(&remaining);
-    }
+        Plan::JsonMap(remaining)
+    };
 
-    let response = builder
+    let build = |token: &str| -> reqwest::RequestBuilder {
+        let builder = http
+            .request(method.clone(), &url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", accept);
+        match &plan {
+            Plan::Query(pairs) => builder.query(pairs),
+            Plan::ReservedBody(body) => with_versioned_content_type(builder, tool_def).json(body),
+            Plan::JsonMap(map) => with_versioned_content_type(builder, tool_def).json(map),
+        }
+    };
+
+    let response = build(&token)
         .send()
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;
+
+    // Single 401 retry with token re-resolution. Device tokens are
+    // user-scoped and die out-of-band (password change, app unlink, the
+    // 20-active-sessions cap — none of which the 60 s pre-expiry refresh
+    // can see), so this hook is the only recovery path short of a full
+    // `allegro-mcp auth device` re-run. Exactly one retry, bounded: if the
+    // retry also fails, its error is returned (the post-refresh body is
+    // more diagnostic than the original 401's).
+    let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        auth.invalidate().await;
+        let fresh = auth.token().await.map_err(|e| format!("auth error: {e}"))?;
+        build(&fresh)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {e}"))?
+    } else {
+        response
+    };
 
     let status = response.status();
     if status.is_client_error() || status.is_server_error() {
@@ -474,6 +511,175 @@ mod tests {
         assert!(
             err.contains("auth error"),
             "sandbox dispatch auth failure must return 'auth error', got: {err}"
+        );
+    }
+
+    // ── dispatch_with_base: single 401 retry with token re-resolution ────────
+    //
+    // wiremock matching order: equal-priority mocks are checked in
+    // registration order and an exhausted `up_to_n_times` mock is skipped —
+    // so the *limited* mock is always mounted first, the fallback last.
+
+    fn get_offers_tool() -> crate::tool_registry::ToolDef {
+        crate::tool_registry::ToolDef {
+            id: "allegro_get_offers".to_string(),
+            name: "allegro_get_offers".to_string(),
+            description: "List offers".to_string(),
+            input_schema: serde_json::json!({}),
+            method: "get".to_string(),
+            path: "/sale/offers".to_string(),
+            accept_media_type: None,
+        }
+    }
+
+    async fn mount_token_ok(mock_server: &wiremock::MockServer, up_to: Option<u64>) {
+        let mock = wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "access_token": "tok", "token_type": "bearer", "expires_in": 43199 }),
+            ));
+        let mock = match up_to {
+            Some(n) => mock.up_to_n_times(n),
+            None => mock,
+        };
+        mock.mount(mock_server).await;
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_with_base_401_once_then_200_succeeds_with_two_api_hits() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        // API: 401 exactly once, then 200 (limited mock mounted FIRST).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("stale token"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+        let tool_def = get_offers_tool();
+
+        let out = dispatch_with_base(
+            &auth,
+            &reqwest::Client::new(),
+            &mock_server.uri(),
+            &tool_def,
+            serde_json::Map::new(),
+        )
+        .await
+        .expect("single 401 must be retried and succeed");
+        assert_eq!(out, "[]");
+
+        let reqs = mock_server.received_requests().await.unwrap();
+        let api_hits = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/sale/offers")
+            .count();
+        let token_hits = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/auth/oauth/token")
+            .count();
+        assert_eq!(api_hits, 2, "the API must be hit twice (401 then 200)");
+        assert_eq!(
+            token_hits, 2,
+            "the token must be re-resolved after the 401 (invalidate + token)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_with_base_persistent_401_returns_second_body() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_token_ok(&mock_server, None).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(401)
+                    .set_body_string("still unauthorized after refresh"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+        let tool_def = get_offers_tool();
+
+        let err = dispatch_with_base(
+            &auth,
+            &reqwest::Client::new(),
+            &mock_server.uri(),
+            &tool_def,
+            serde_json::Map::new(),
+        )
+        .await
+        .expect_err("persistent 401 must fail");
+        assert!(
+            err.contains("still unauthorized after refresh"),
+            "the retry's body must be surfaced (not the first 401's), got: {err}"
+        );
+        assert!(err.contains("401"), "status must be included, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_with_base_auth_failure_on_re_resolve_is_auth_error() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Token endpoint: 200 exactly once (the initial fetch), then 500 —
+        // the post-401 re-resolve fails. Limited mock mounted FIRST.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "access_token": "tok", "token_type": "bearer", "expires_in": 43199 }),
+            ))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/oauth/token"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        // API: always 401, so the retry path runs.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sale/offers"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let auth = crate::auth::AllegroAuth::with_base_url(
+            "id".to_string(),
+            "secret".to_string(),
+            mock_server.uri(),
+        );
+        let tool_def = get_offers_tool();
+
+        let err = dispatch_with_base(
+            &auth,
+            &reqwest::Client::new(),
+            &mock_server.uri(),
+            &tool_def,
+            serde_json::Map::new(),
+        )
+        .await
+        .expect_err("failed re-resolve must fail the dispatch");
+        assert!(
+            err.contains("auth error"),
+            "re-resolve failure must surface as 'auth error', got: {err}"
         );
     }
 }

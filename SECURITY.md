@@ -22,13 +22,22 @@ like you'd treat direct database access, not like a public API endpoint.
   Rotate it by changing the env var and recreating the container — there
   is no other state to clean up, since the token is only ever checked
   in-memory and never written anywhere.
-- Today, **no credential or token is ever written to disk** by this
-  process. The `token_path` config field (`src/config.rs`) is reserved for
-  a future phase. The `allegro-mcp-tokens` named volume in
-  `docker-compose.yml` currently only matters if you choose to mount an
-  optional `allegro-mcp.toml` config file there — it's forward-compatible
-  with a future on-disk token cache, but it is not load-bearing for
-  security today.
+- Device-flow tokens (`auth_flow = "device_code"`) **are persisted to disk**:
+  one versioned JSON file at `token_path` (default
+  `~/.config/allegro-mcp/tokens.json`, overridable via `ALLEGRO_MCP_TOKEN_PATH`
+  or `auth device --token-path`). The file holds the bearer access token and
+  the single-use refresh token. It is written **atomically** (temp file in
+  the same directory + `rename`, no torn state) with `0600` permissions, and
+  the `allegro-mcp/` directory is created `0700` if it doesn't already exist
+  (a pre-existing directory's permissions are never modified). The refresh
+  token is single-use and rotated by Allegro on every refresh; the rotated
+  pair is persisted *before* the in-memory cache is updated, so the on-disk
+  copy is always the only live one. Tokens are environment-labelled
+  (`production` / `sandbox`) and refuse to load under the wrong flag. Run
+  the container with a mounted volume for this path (the
+  `allegro-mcp-tokens` named volume in `docker-compose.yml`), and treat the
+  file with the same sensitivity as the client secret above. In
+  `client_credentials` mode nothing is ever written to disk.
 
 ## Network exposure
 
