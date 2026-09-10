@@ -63,18 +63,23 @@ pub enum ConfigError {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-/// OAuth2 flow used to obtain application tokens.
+/// OAuth2 flow used to obtain Allegro tokens.
 ///
-/// Only `client_credentials` exists today; the enum (with
-/// `#[serde(rename_all = "snake_case")]`, so TOML writes
-/// `auth_flow = "client_credentials"`) keeps the config file key
-/// forward-compatible with future flows. Unknown values are startup errors
-/// listing the supported ones.
+/// `client_credentials` mints **application** tokens from the client
+/// id/secret pair. `device_code` (RFC 8628-style) mints **user-scoped**
+/// tokens: `allegro-mcp auth device` drives the interactive part (device
+/// code + verification URL + polling) and persists the rotating token pair
+/// at [`Config::token_path`], which the server then restores/refreshes.
+///
+/// With `#[serde(rename_all = "snake_case")]`, TOML writes
+/// `auth_flow = "client_credentials"` / `"device_code"`. Unknown values are
+/// startup errors listing the supported ones.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthFlow {
     #[default]
     ClientCredentials,
+    DeviceCode,
 }
 
 /// Tool name filters (`allow` / `deny` prefix lists) — parsed here, consumed
@@ -119,7 +124,16 @@ pub struct Config {
     /// OAuth2 scopes requested on the token fetch (space-joined into the
     /// `scope` form param when non-empty).
     pub scopes: Vec<String>,
-    /// On-disk token cache location — reserved for a future phase.
+    /// On-disk token persistence location, consumed by the device flow
+    /// (`auth_flow = "device_code"`): the granted token pair and any
+    /// in-flight device grant live in this versioned JSON file, written
+    /// atomically with `0600` permissions (see `src/auth/token_store.rs`).
+    ///
+    /// Default: `dirs::config_dir()/allegro-mcp/tokens.json`. Relative paths
+    /// are resolved against the process's current working directory.
+    /// `ALLEGRO_MCP_TOKEN_PATH` (env) overrides the file value; the
+    /// `auth device --token-path` flag overrides both for the interactive
+    /// flow.
     pub token_path: Option<PathBuf>,
     /// Tool filters — parsed now, consumed in Phase 10.
     pub tools: Option<ToolFilters>,
@@ -386,6 +400,16 @@ impl Config {
         }
         if let Ok(v) = std::env::var("ALLEGRO_MCP_ACCEPT_LANGUAGE") {
             cfg.accept_language = v.trim().to_owned();
+        }
+        // Token-store path override (device flow). An empty/whitespace value
+        // is ignored — same hygiene as `ALLEGRO_MCP_CONFIG` in
+        // `discover_path`, so an unset-looking var never clobbers the file
+        // value with an empty path.
+        if let Ok(v) = std::env::var("ALLEGRO_MCP_TOKEN_PATH") {
+            let v = v.trim();
+            if !v.is_empty() {
+                cfg.token_path = Some(PathBuf::from(v));
+            }
         }
         // URL before FILE so that, when both env vars are set, the file wins
         // (env file > env url); each step clears the opposite field because a
@@ -758,13 +782,23 @@ mod tests {
 
     #[test]
     fn from_toml_str_unknown_auth_flow_errors_listing_supported_values() {
-        let err = Config::from_toml_str("auth_flow = \"device_code\"\n")
+        // `authorization_code` is a real Allegro flow this server does not
+        // implement — a natural typo candidate that must still be rejected
+        // with the full list of supported values.
+        let err = Config::from_toml_str("auth_flow = \"authorization_code\"\n")
             .expect_err("unknown flow must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("client_credentials"),
-            "error must list the supported value(s), got: {msg}"
+            msg.contains("client_credentials") && msg.contains("device_code"),
+            "error must list both supported values, got: {msg}"
         );
+    }
+
+    #[test]
+    fn from_toml_str_device_code_flow_parses() {
+        let cfg =
+            Config::from_toml_str("auth_flow = \"device_code\"\n").expect("device_code must parse");
+        assert_eq!(cfg.auth_flow, AuthFlow::DeviceCode);
     }
 
     #[test]
@@ -1016,6 +1050,43 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_env_token_path_override() {
+        with_env(
+            &[("ALLEGRO_MCP_TOKEN_PATH", Some("/tmp/from-env-tokens.json"))],
+            || {
+                let mut cfg = Config {
+                    token_path: Some(PathBuf::from("/from/config-file.json")),
+                    ..Config::default()
+                };
+                Config::apply_env(&mut cfg).expect("apply_env");
+                assert_eq!(
+                    cfg.token_path.as_deref(),
+                    Some(Path::new("/tmp/from-env-tokens.json")),
+                    "env token path must beat the config file's"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_env_token_path_empty_ignored() {
+        with_env(&[("ALLEGRO_MCP_TOKEN_PATH", Some("   "))], || {
+            let mut cfg = Config {
+                token_path: Some(PathBuf::from("/from/config-file.json")),
+                ..Config::default()
+            };
+            Config::apply_env(&mut cfg).expect("apply_env");
+            assert_eq!(
+                cfg.token_path.as_deref(),
+                Some(Path::new("/from/config-file.json")),
+                "an empty env value must be ignored, never clobber the file value"
+            );
+        });
     }
 
     // ── apply_cli ─────────────────────────────────────────────────────────────

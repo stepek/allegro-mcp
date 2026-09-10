@@ -1,9 +1,25 @@
-//! Allegro OAuth2 `client_credentials` flow.
+//! Allegro OAuth2 token management — the [`AllegroAuth`] façade over the
+//! supported flows.
 //!
-//! Provides [`AllegroAuth`] — a thread-safe, async-friendly token manager
-//! that fetches application tokens and caches them in memory, refreshing
-//! 60 seconds before expiry.
+//! Two resolution chains sit behind one type (call sites hold
+//! `&AllegroAuth`/`Arc<AllegroAuth>` concretely — no trait indirection):
+//!
+//! - **`client_credentials`** (default): fetches application tokens from the
+//!   token endpoint and caches them in memory, refreshing 60 s before
+//!   expiry. Nothing touches disk.
+//! - **`device_code`** (RFC 8628-style, activated by
+//!   [`AllegroAuth::with_token_store`]): resolves user-scoped tokens through
+//!   a persisted [`token_store::TokenStore`] — a live stored access token
+//!   first, then the single-use **refresh grant** (Allegro rotates the pair
+//!   on every refresh; the new pair is persisted before the in-memory cache
+//!   is touched), otherwise a `ReauthRequired` error pointing at
+//!   `allegro-mcp auth device`. The interactive half of the flow (device
+//!   code request + polling) lives in [`device`].
 
+pub mod device;
+pub mod token_store;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -12,9 +28,21 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use device::u64_lenient;
+use token_store::TokenStore;
+
+/// Client-side age cap for a stored refresh token: Allegro's docs give the
+/// (single-use) refresh token a ~3-month lifetime but never return its
+/// expiry in-band, so we stop trying to refresh 1 day *before* the 90-day
+/// mark (`90 * 24 * 3600 - 86_400` = 89 days) and demand re-authorization
+/// instead.
+const REFRESH_TOKEN_MAX_AGE_SECS: u64 = 90 * 24 * 3600 - 86_400;
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
-/// Errors that can occur during authentication.
+/// Errors that can occur during authentication. One public error surface for
+/// both flows — the store/device submodules reuse these variants rather than
+/// growing parallel enums.
 #[derive(Debug, Error)]
 pub enum AuthError {
     /// Constructed by [`AllegroAuth::from_env`] (library/tests API). The
@@ -32,16 +60,57 @@ pub enum AuthError {
     #[allow(dead_code)]
     #[error("token response missing required field: {0}")]
     MalformedResponse(&'static str),
+
+    /// Device mode: the stored authorization cannot serve tokens (nothing
+    /// stored, revoked, or refresh rejected) — the user must run
+    /// `allegro-mcp auth device` again.
+    #[error("re-authorization required: {reason} — run `allegro-mcp auth device`")]
+    ReauthRequired { reason: String },
+
+    /// Token-store I/O or (de)serialization failure; the message names the
+    /// file. A corrupt store is surfaced, never auto-deleted.
+    #[error("token store error: {0}")]
+    StoreIo(String),
+
+    /// The token file was written by a newer/older allegro-mcp format.
+    #[error(
+        "token store version {found} is not supported (expected 1) — delete the file or upgrade"
+    )]
+    StoreVersion { found: u64 },
+
+    /// Tokens are not interchangeable between environments; the file's
+    /// label must match the flag this process runs with.
+    #[error(
+        "tokens.json was created for the {stored} environment but allegro-mcp is running against {current}"
+    )]
+    EnvMismatch {
+        stored: &'static str,
+        current: &'static str,
+    },
 }
 
 // ── Token response ────────────────────────────────────────────────────────────
 
-/// Raw token response from `POST /auth/oauth/token`.
-#[derive(Debug, Deserialize)]
+/// Raw token response from `POST /auth/oauth/token` (both the
+/// `client_credentials` grant, the device-code poll, and the refresh grant
+/// produce this shape).
+#[derive(Debug, Clone, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     /// Lifetime in seconds (Allegro issues 12-hour tokens = 43 200 s).
+    /// Leniently parsed: the API has been seen returning quoted numbers.
+    #[serde(deserialize_with = "u64_lenient")]
     pub expires_in: u64,
+    /// Always `"bearer"` in practice — kept for logging/completeness.
+    /// Echoed OAuth2 token type (always `"bearer"` in practice) — parsed
+    /// for schema completeness; no behavior keys off it.
+    // The bin crate re-declares this module privately, so an unread pub
+    // field trips dead_code there even though it is public lib API.
+    #[allow(dead_code)]
+    pub token_type: Option<String>,
+    /// Single-use refresh token (device flow only; `client_credentials`
+    /// responses never carry one). Allegro rotates it on every refresh.
+    pub refresh_token: Option<String>,
     // `scope` and `jti` are part of the Allegro token contract; exposed for
     // future phases that may need to inspect or log them.
     pub scope: Option<String>,
@@ -71,12 +140,25 @@ impl CachedToken {
     }
 }
 
+// ── Flow mode ─────────────────────────────────────────────────────────────────
+
+/// Which resolution chain [`AllegroAuth::token`] uses. Constructors default
+/// to [`FlowMode::ClientCredentials`] so every pre-existing call site keeps
+/// its semantics; [`AllegroAuth::with_token_store`] flips to device mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowMode {
+    ClientCredentials,
+    Device,
+}
+
 // ── AllegroAuth ───────────────────────────────────────────────────────────────
 
-/// Thread-safe Allegro application-token manager.
+/// Thread-safe Allegro token manager.
 ///
-/// Fetches tokens via the `client_credentials` OAuth2 grant and caches them
-/// in memory, refreshing 60 seconds before expiry.
+/// `client_credentials` mode (default) fetches application tokens and caches
+/// them in memory, refreshing 60 seconds before expiry. Device mode (via
+/// [`Self::with_token_store`]) additionally persists/rotates user-scoped
+/// tokens through a [`TokenStore`].
 ///
 /// # Example
 /// ```no_run
@@ -101,6 +183,19 @@ pub struct AllegroAuth {
     /// body to the scope-less flow.
     scopes: Vec<String>,
     cache: RwLock<Option<CachedToken>>,
+    /// Resolution chain selection — see [`FlowMode`].
+    mode: FlowMode,
+    /// Device-mode persistence. `None` in client_credentials mode.
+    store: Option<TokenStore>,
+    /// One-shot forced-refresh flag: set by [`Self::refresh_now`] (the
+    /// dispatcher's 401 hook), consumed by [`Self::resolve_device_token`].
+    /// An out-of-band revocation never changes the stored token's
+    /// `expires_at_epoch`, so a plain post-401 re-read would hand back the
+    /// very token the API just rejected — the flag makes the next
+    /// device-mode resolution skip the stored live token and exercise the
+    /// refresh grant instead. `AtomicBool` because it travels through
+    /// `&self` alongside the resolution chain's write lock.
+    force_refresh: AtomicBool,
 }
 
 /// Manual `Debug` impl — redacts `client_secret` to prevent accidental logging.
@@ -196,6 +291,9 @@ impl AllegroAuth {
             http,
             scopes: Vec::new(),
             cache: RwLock::new(None),
+            mode: FlowMode::ClientCredentials,
+            store: None,
+            force_refresh: AtomicBool::new(false),
         }
     }
 
@@ -206,6 +304,25 @@ impl AllegroAuth {
     pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
         self.scopes = scopes;
         self
+    }
+
+    /// Switches to **device mode**: [`Self::token`] resolves user-scoped
+    /// tokens through `store` (live stored token → single-use refresh grant
+    /// → `ReauthRequired` pointing at `allegro-mcp auth device`) instead of
+    /// minting application tokens from the client credentials.
+    pub fn with_token_store(mut self, store: TokenStore) -> Self {
+        self.mode = FlowMode::Device;
+        self.store = Some(store);
+        self
+    }
+
+    /// `"client_credentials"` or `"device_code"` — the label surfaced by
+    /// `/auth/status` and the flow-aware startup banner.
+    pub fn flow_label(&self) -> &'static str {
+        match self.mode {
+            FlowMode::ClientCredentials => "client_credentials",
+            FlowMode::Device => "device_code",
+        }
     }
 
     /// Returns a valid access token, fetching a new one if necessary.
@@ -233,30 +350,26 @@ impl AllegroAuth {
             }
         }
 
-        // Fetch a fresh token.
-        let resp = self.fetch_token().await?;
-
-        // Clamp expires_in to a minimum of 120 s to prevent an infinite refresh
-        // loop if the server returns a pathologically short lifetime.
-        let effective_expires_in = if resp.expires_in < 120 {
-            warn!(
-                expires_in = resp.expires_in,
-                "token expires_in is very short — clamping to 120 s to avoid refresh loop"
-            );
-            120
-        } else {
-            resp.expires_in
+        // Fetch a fresh token — the chain differs per flow mode
+        // (client_credentials: straight grant; device: store → refresh
+        // grant → ReauthRequired).
+        let (token, effective_expires_in) = match self.mode {
+            FlowMode::ClientCredentials => {
+                let resp = self.fetch_token().await?;
+                let effective_expires_in = clamp_expires_in(resp.expires_in);
+                debug!(expires_in = resp.expires_in, "fetched new access token");
+                (resp.access_token.clone(), effective_expires_in)
+            }
+            FlowMode::Device => self.resolve_device_token().await?,
         };
 
         // Store the raw expiry instant; `is_valid()` applies the 60 s guard.
         let expires_at = Instant::now() + Duration::from_secs(effective_expires_in);
 
-        debug!(expires_in = resp.expires_in, "fetched new access token");
         info!("access token refreshed");
 
-        let token = resp.access_token.clone();
         *guard = Some(CachedToken {
-            access_token: resp.access_token,
+            access_token: token.clone(),
             expires_at,
         });
 
@@ -295,15 +408,225 @@ impl AllegroAuth {
         Ok(token_resp)
     }
 
-    /// Returns a snapshot of the current token-cache state without
-    /// triggering a fetch or refresh — a read-only status check, safe to call
-    /// from an unauthenticated-by-default endpoint (it reveals cache
-    /// freshness, never the token itself).
+    /// Device-mode resolution chain, run inside the double-checked
+    /// write-lock slow path (so the single-flight guarantee holds):
+    ///
+    /// 1. store has an **unexpired** access token (epoch now <
+    ///    `expires_at_epoch` − 60, the same 60 s guard the cache applies)
+    ///    → seed the cache from it — zero network;
+    /// 2. else, a refresh token young enough for the 89-day heuristic →
+    ///    single-use **refresh grant**; the rotated pair is persisted
+    ///    *before* the cache is touched (rotation is single-use — losing
+    ///    the new refresh token to a crash means full re-auth, so disk
+    ///    goes first). A definitive rejection triggers the stale-store
+    ///    guard (see [`Self::refresh_grant`]);
+    /// 3. else → [`AuthError::ReauthRequired`]: nothing usable is stored.
+    ///
+    /// **Forced mode** — [`Self::refresh_now`] set the one-shot flag before
+    /// this call (the dispatcher's 401 hook): step 1 is skipped, because a
+    /// 401 means the API just rejected the very token the store holds and
+    /// an out-of-band revocation never bumps `expires_at_epoch`. The
+    /// refresh grant gets the first shot; the stored access token remains
+    /// the fallback when the refresh cannot reach a verdict (transient
+    /// 5xx / transport failure, or nothing refreshable stored) — a flaky
+    /// auth server must not take down a possibly-working token. A
+    /// *definitive* rejection is never fallen back from: it clears the
+    /// store and propagates [`AuthError::ReauthRequired`].
+    async fn resolve_device_token(&self) -> Result<(String, u64), AuthError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| AuthError::ReauthRequired {
+                reason: "no token store configured".to_owned(),
+            })?;
+
+        // Consume the one-shot flag exactly once, inside the write lock —
+        // so exactly one resolution honors it.
+        let forced = self.force_refresh.swap(false, Ordering::SeqCst);
+
+        let state = store.load()?;
+        let Some(tokens) = state.tokens else {
+            // Distinguish "nothing at all" from "grant still pending" —
+            // both are re-auth situations, but the hint differs.
+            let reason = if state.pending.is_some() {
+                "a device authorization is pending — run `allegro-mcp auth device` to complete it"
+            } else {
+                "no stored device authorization"
+            };
+            return Err(AuthError::ReauthRequired {
+                reason: reason.to_owned(),
+            });
+        };
+
+        let now = token_store::epoch_now();
+        // The 60 s guard applied to the stored token (same as the cache's).
+        let stored_is_live = now < tokens.expires_at_epoch.saturating_sub(60);
+        if !forced && stored_is_live {
+            // Live stored access token — restore without any network call.
+            let remaining = tokens.expires_at_epoch - now;
+            debug!(
+                remaining_secs = remaining,
+                "device mode: restoring persisted access token from the token store"
+            );
+            return Ok((tokens.access_token.clone(), clamp_expires_in(remaining)));
+        }
+
+        // Access token expired (< 60 s left) — or the API just rejected it
+        // out-of-band (forced) → refresh grant, if the stored refresh token
+        // is young enough to plausibly still work.
+        if let Some(refresh_token) = tokens.refresh_token.as_deref() {
+            if now.saturating_sub(tokens.updated_at_epoch) <= REFRESH_TOKEN_MAX_AGE_SECS {
+                match self.refresh_grant(refresh_token).await {
+                    Ok(resp) => {
+                        let effective = clamp_expires_in(resp.expires_in);
+                        // Persist the rotated pair BEFORE the in-memory
+                        // cache is seeded (caller does that): the new
+                        // refresh token is single-use and exists nowhere
+                        // else — see the rotation crash-window note.
+                        store.save_tokens(&resp, effective)?;
+                        info!("device mode: refresh grant rotated the token pair");
+                        return Ok((resp.access_token.clone(), effective));
+                    }
+                    Err(AuthError::Http(e)) if is_definitive_rejection(&e) => {
+                        // Stale-store guard: a concurrent `auth device` run
+                        // may have rotated the file between our load and
+                        // this refresh. Reload once and retry only if the
+                        // stored refresh token differs from the one that
+                        // was just rejected.
+                        let fresh = store.load()?;
+                        let fresh_refresh = fresh
+                            .tokens
+                            .as_ref()
+                            .and_then(|t| t.refresh_token.as_deref());
+                        if let Some(newer) = fresh_refresh {
+                            if newer != refresh_token {
+                                warn!("device mode: token store was rotated concurrently — retrying refresh with the newer token");
+                                match self.refresh_grant(newer).await {
+                                    Ok(resp) => {
+                                        let effective = clamp_expires_in(resp.expires_in);
+                                        store.save_tokens(&resp, effective)?;
+                                        return Ok((resp.access_token.clone(), effective));
+                                    }
+                                    // Transient failure of the retried
+                                    // refresh: the newer pair on disk is
+                                    // possibly still valid — keep the file
+                                    // and surface the error instead of
+                                    // wiping usable state.
+                                    Err(retry_err) if !matches!(&retry_err, AuthError::Http(h) if is_definitive_rejection(h)) =>
+                                    {
+                                        return Err(retry_err);
+                                    }
+                                    // Definitively rejected too: fall
+                                    // through to the wipe below.
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        // Definitively dead: wipe the file so the next run
+                        // sees a clean "no authorization" state.
+                        store.clear()?;
+                        return Err(AuthError::ReauthRequired {
+                            reason: "refresh token rejected — authorization was revoked or expired"
+                                .to_owned(),
+                        });
+                    }
+                    Err(e) => {
+                        // Transient refresh failure (5xx / transport).
+                        // Forced post-401: the stored token is still the
+                        // best known state — hand it back for the
+                        // dispatcher's single retry instead of failing the
+                        // dispatch outright.
+                        if forced && stored_is_live {
+                            warn!(
+                                error = %e,
+                                "device mode: forced refresh failed transiently — falling back to the stored access token"
+                            );
+                            let remaining = tokens.expires_at_epoch - now;
+                            return Ok((tokens.access_token.clone(), clamp_expires_in(remaining)));
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // Nothing refreshable: no refresh token stored, or it aged past the
+        // 89-day heuristic. Forced post-401 with a live stored token: it is
+        // all we have — hand it back and let the retried request decide (a
+        // definitive revocation would have surfaced through the refresh
+        // grant above).
+        if forced && stored_is_live {
+            warn!(
+                "device mode: forced refresh has no usable refresh token — falling back to the stored access token"
+            );
+            let remaining = tokens.expires_at_epoch - now;
+            return Ok((tokens.access_token.clone(), clamp_expires_in(remaining)));
+        }
+
+        Err(AuthError::ReauthRequired {
+            reason: "stored device authorization expired and no usable refresh token remains"
+                .to_owned(),
+        })
+    }
+
+    /// The single-use refresh grant: `POST /auth/oauth/token` with
+    /// `grant_type=refresh_token` (no `scope` param — the docs don't send
+    /// one and the response carries the scope).
+    ///
+    /// A 4xx here is a *definitive* rejection (`invalid_grant`-style — the
+    /// token was rotated away, revoked, or expired), surfaced as
+    /// [`AuthError::Http`] so the caller's stale-store guard can inspect
+    /// the status via [`is_definitive_rejection`].
+    async fn refresh_grant(&self, refresh_token: &str) -> Result<TokenResponse, AuthError> {
+        let url = format!("{}/auth/oauth/token", self.auth_base_url);
+        debug!(
+            url,
+            "device mode: running the single-use refresh_token grant"
+        );
+
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ];
+        let resp = self
+            .http
+            .post(&url)
+            .basic_auth(&self.client_id, Some(&self.client_secret))
+            .form(&form)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let parsed: TokenResponse = resp.json().await?;
+        debug!(
+            scope = parsed.scope.as_deref(),
+            rotated = parsed.refresh_token.is_some(),
+            "refresh grant response received"
+        );
+        Ok(parsed)
+    }
+
+    /// Returns a snapshot of the current token state without triggering a
+    /// fetch or refresh — a read-only status check, safe to call from an
+    /// unauthenticated-by-default endpoint (it reveals cache freshness,
+    /// never the token itself).
+    ///
+    /// Device mode additionally probes the store for a persisted pair
+    /// (`persisted = true`), so the flow-aware startup banner can
+    /// distinguish "restored" from "still pending" without a network call.
     pub async fn status(&self) -> AuthStatus {
+        let persisted = match (&self.mode, &self.store) {
+            (FlowMode::Device, Some(store)) => store
+                .load()
+                .map(|state| state.tokens.is_some())
+                .unwrap_or(false),
+            _ => false,
+        };
         let guard = self.cache.read().await;
         match guard.as_ref() {
             Some(cached) => AuthStatus {
-                auth_flow: "client_credentials",
+                auth_flow: self.flow_label(),
+                persisted,
                 token_cached: true,
                 token_valid: cached.is_valid(),
                 expires_in_secs: cached
@@ -312,25 +635,114 @@ impl AllegroAuth {
                     .map(|d| d.as_secs()),
             },
             None => AuthStatus {
-                auth_flow: "client_credentials",
+                auth_flow: self.flow_label(),
+                persisted,
                 token_cached: false,
                 token_valid: false,
                 expires_in_secs: None,
             },
         }
     }
+
+    /// Drops the in-memory cache in **both** modes, forcing the next
+    /// [`Self::token`] call through the full resolution chain. Building
+    /// block of [`Self::refresh_now`] — the dispatcher's 401 auto-refresh
+    /// hook (a 401 means the cached token died out-of-band: password
+    /// change, app unlink, session cap). Deliberately cache-only: the
+    /// forced refresh-grant behavior lives behind [`Self::refresh_now`]'s
+    /// one-shot flag, so a bare invalidate still restores the persisted
+    /// pair without touching the network.
+    pub async fn invalidate(&self) {
+        let mut guard = self.cache.write().await;
+        *guard = None;
+    }
+
+    /// Device mode only: persists a freshly granted pair (e.g. from a
+    /// completed device poll) into the store and seeds the in-memory cache
+    /// from it. Used by the server-side resume task and available to the
+    /// CLI. The store write happens first — same rotation-crash ordering as
+    /// the refresh grant.
+    pub async fn install_tokens(&self, resp: &TokenResponse) -> Result<(), AuthError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| AuthError::ReauthRequired {
+                reason: "no token store configured — install_tokens requires device mode"
+                    .to_owned(),
+            })?;
+        let effective = clamp_expires_in(resp.expires_in);
+        store.save_tokens(resp, effective)?;
+
+        let mut guard = self.cache.write().await;
+        *guard = Some(CachedToken {
+            access_token: resp.access_token.clone(),
+            expires_at: Instant::now() + Duration::from_secs(effective),
+        });
+        Ok(())
+    }
+
+    /// Forces a re-resolution right now: sets the one-shot forced-refresh
+    /// flag (consumed by [`Self::resolve_device_token`]) *before* dropping
+    /// the in-memory cache, then runs the [`Self::token`] chain. Flag-first
+    /// ordering closes a race: a concurrent plain [`Self::token`] could
+    /// otherwise acquire the write lock between the cache drop and the
+    /// flag store and repopulate the cache from the revoked stored token.
+    /// In device mode the stored *live* access token is skipped and
+    /// the single-use refresh grant gets the first shot — the stored token
+    /// remains the fallback when the refresh fails transiently (5xx /
+    /// transport), while a definitive rejection propagates as
+    /// [`AuthError::ReauthRequired`]. In client_credentials mode this is a
+    /// plain refetch of the application token.
+    ///
+    /// Used by the dispatcher's 401 retry: a 401 means the token died
+    /// out-of-band (password change, app unlink, session cap — none of
+    /// which the 60 s pre-expiry refresh can see), and a plain re-read
+    /// would hand back the very token the API just rejected, because an
+    /// out-of-band revocation never changes the stored `expires_at_epoch`.
+    pub async fn refresh_now(&self) -> Result<String, AuthError> {
+        // Flag BEFORE invalidate: see the doc comment — a concurrent plain
+        // `token()` must not repopulate the cache from the revoked token.
+        self.force_refresh.store(true, Ordering::SeqCst);
+        self.invalidate().await;
+        self.token().await
+    }
 }
 
-/// A point-in-time snapshot of the token cache, for the `/auth/status`
+/// Clamps `expires_in` to a minimum of 120 s to prevent an infinite refresh
+/// loop if the server returns a pathologically short lifetime. Applied to
+/// fetched, stored-remaining, and refreshed lifetimes alike.
+fn clamp_expires_in(expires_in: u64) -> u64 {
+    if expires_in < 120 {
+        warn!(
+            expires_in,
+            "token expires_in is very short — clamping to 120 s to avoid refresh loop"
+        );
+        120
+    } else {
+        expires_in
+    }
+}
+
+/// `true` when a refresh-grant HTTP error means "this refresh token is
+/// definitively dead" (4xx family: rotated away / revoked / expired) rather
+/// than "the network or the auth server hiccuped" (transport / 5xx).
+fn is_definitive_rejection(e: &reqwest::Error) -> bool {
+    matches!(e.status(), Some(status) if (400..500).contains(&status.as_u16()))
+}
+
+/// A point-in-time snapshot of the token state, for the `/auth/status`
 /// HTTP endpoint (admin visibility — see `src/http_server.rs`). Never
 /// exposes the token itself.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuthStatus {
-    /// Always `"client_credentials"` today — this crate does not
-    /// implement a device-authorization / user-consent flow yet.
+    /// The active flow's label: `"client_credentials"` or `"device_code"`
+    /// (see [`AllegroAuth::flow_label`]).
     pub auth_flow: &'static str,
-    /// `true` once at least one token fetch has succeeded since process
-    /// start (the in-memory cache is never persisted to disk today).
+    /// Device mode: the store currently holds a granted token pair.
+    /// `client_credentials` mode: always `false` (nothing is persisted).
+    pub persisted: bool,
+    /// `true` once at least one token has been resolved into the in-memory
+    /// cache since process start.
     pub token_cached: bool,
     /// `true` when the cached token still has > 60 s remaining (the same
     /// threshold `token()` uses to decide whether to refresh).
@@ -648,5 +1060,202 @@ mod tests {
         let status = auth.status().await;
         assert!(status.token_cached);
         assert!(!status.token_valid);
+    }
+
+    // ── Flow mode / device-mode façade (unit-level: no network) ──────────────
+
+    fn token_response(access: &str, refresh: Option<&str>) -> TokenResponse {
+        TokenResponse {
+            access_token: access.to_owned(),
+            expires_in: 3600,
+            token_type: Some("bearer".to_owned()),
+            refresh_token: refresh.map(str::to_owned),
+            scope: Some("allegro:api:read".to_owned()),
+            jti: None,
+        }
+    }
+
+    #[test]
+    fn flow_label_follows_the_active_mode() {
+        let cc = AllegroAuth::new("id".to_owned(), "secret".to_owned(), false);
+        assert_eq!(cc.flow_label(), "client_credentials");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = AllegroAuth::with_base_url(
+            "id".to_owned(),
+            "secret".to_owned(),
+            "https://example.com".to_owned(),
+        )
+        .with_token_store(token_store::TokenStore::new(
+            dir.path().join("tokens.json"),
+            false,
+        ));
+        assert_eq!(device.flow_label(), "device_code");
+    }
+
+    #[tokio::test]
+    async fn install_tokens_persists_and_seeds_the_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AllegroAuth::with_base_url(
+            "id".to_owned(),
+            "secret".to_owned(),
+            "https://example.com".to_owned(),
+        )
+        .with_token_store(token_store::TokenStore::new(
+            dir.path().join("tokens.json"),
+            false,
+        ));
+
+        auth.install_tokens(&token_response("installed", Some("rfr")))
+            .await
+            .expect("install");
+
+        // Cache seeded — no network involved (base URL is a dead host).
+        let token = auth.token().await.expect("cache-seeded token");
+        assert_eq!(token, "installed");
+
+        let status = auth.status().await;
+        assert!(status.token_cached && status.token_valid);
+        assert!(status.persisted, "the store holds a granted pair");
+
+        // The file really landed on disk.
+        assert!(dir.path().join("tokens.json").exists());
+    }
+
+    #[tokio::test]
+    async fn install_tokens_requires_device_mode() {
+        let auth = AllegroAuth::new("id".to_owned(), "secret".to_owned(), false);
+        let err = auth
+            .install_tokens(&token_response("tok", None))
+            .await
+            .expect_err("client_credentials mode has no store");
+        assert!(
+            matches!(err, AuthError::ReauthRequired { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_forces_the_next_token_call_to_re_resolve() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AllegroAuth::with_base_url(
+            "id".to_owned(),
+            "secret".to_owned(),
+            "https://example.com".to_owned(),
+        )
+        .with_token_store(token_store::TokenStore::new(
+            dir.path().join("tokens.json"),
+            false,
+        ));
+        auth.install_tokens(&token_response("before", None))
+            .await
+            .expect("install");
+        assert!(auth.status().await.token_cached);
+
+        auth.invalidate().await;
+        let status = auth.status().await;
+        assert!(!status.token_cached, "cache must be empty after invalidate");
+        assert!(
+            status.persisted,
+            "the persisted pair survives an invalidate"
+        );
+
+        // Re-resolution goes through the store (never the network here —
+        // the base URL points at a dead host, so any HTTP attempt would
+        // error out instead of returning "before").
+        assert_eq!(auth.token().await.expect("restored"), "before");
+    }
+
+    /// `refresh_now` must force the refresh grant past a *live* stored
+    /// token. The auth host is unresolvable (RFC 2606 `.invalid`), so the
+    /// forced refresh fails with a transport error — a *transient* failure,
+    /// which must fall back to the stored access token and leave the store
+    /// untouched (the wire-level happy path is covered by the integration
+    /// suite, `tests/device_flow_integration.rs` §8).
+    #[tokio::test]
+    async fn refresh_now_falls_back_to_the_stored_token_on_transient_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AllegroAuth::with_base_url(
+            "id".to_owned(),
+            "secret".to_owned(),
+            "https://unit-test.invalid".to_owned(),
+        )
+        .with_token_store(token_store::TokenStore::new(
+            dir.path().join("tokens.json"),
+            false,
+        ));
+        auth.install_tokens(&token_response("live", Some("rfr")))
+            .await
+            .expect("install");
+
+        let token = auth
+            .refresh_now()
+            .await
+            .expect("a transient forced-refresh failure must fall back to the stored token");
+        assert_eq!(token, "live");
+
+        // The stored pair survived the failed forced refresh.
+        let state = token_store::TokenStore::new(dir.path().join("tokens.json"), false)
+            .load()
+            .expect("store readable");
+        let saved = state.tokens.expect("pair kept on a transient failure");
+        assert_eq!(saved.access_token, "live");
+        assert_eq!(saved.refresh_token.as_deref(), Some("rfr"));
+    }
+
+    #[tokio::test]
+    async fn status_persisted_flag_tracks_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AllegroAuth::with_base_url(
+            "id".to_owned(),
+            "secret".to_owned(),
+            "https://example.com".to_owned(),
+        )
+        .with_token_store(token_store::TokenStore::new(
+            dir.path().join("tokens.json"),
+            false,
+        ));
+
+        assert!(
+            !auth.status().await.persisted,
+            "an empty store holds no granted pair"
+        );
+
+        auth.install_tokens(&token_response("tok", None))
+            .await
+            .expect("install");
+        assert!(auth.status().await.persisted);
+    }
+
+    #[tokio::test]
+    async fn status_persisted_is_always_false_for_client_credentials() {
+        let auth = AllegroAuth::new("id".to_owned(), "secret".to_owned(), false);
+        {
+            let mut guard = auth.cache.write().await;
+            *guard = Some(CachedToken {
+                access_token: "tok".to_owned(),
+                expires_at: Instant::now() + Duration::from_secs(3600),
+            });
+        }
+        let status = auth.status().await;
+        assert!(status.token_cached);
+        assert!(
+            !status.persisted,
+            "client_credentials never persists tokens"
+        );
+        assert_eq!(status.auth_flow, "client_credentials");
+    }
+
+    /// The `AuthError` display strings consumed by CLI/UX copy.
+    #[test]
+    fn reauth_required_error_display_mentions_the_cli() {
+        let err = AuthError::ReauthRequired {
+            reason: "no stored device authorization".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allegro-mcp auth device"),
+            "the error must point at the CLI command, got: {msg}"
+        );
     }
 }
