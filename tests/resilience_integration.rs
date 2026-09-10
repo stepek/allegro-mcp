@@ -320,6 +320,10 @@ async fn dispatch_token_mint_429_not_retried() {
         .await
         .expect_err("a mint-side 429 must surface, not loop");
     assert!(err.contains("token churn"), "got: {err}");
+    // The token endpoint's Trace-Id must reach the report (render_auth_error
+    // appends it) — pins the "Trace-Id in all error paths" bullet at the
+    // wire level for the auth surface.
+    assert!(err.contains("Trace-Id: tr-mint"), "got: {err}");
 
     assert_eq!(
         count_hits(&mock, "/auth/oauth/token").await,

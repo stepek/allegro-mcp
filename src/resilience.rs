@@ -568,12 +568,31 @@ fn epoch_second() -> u64 {
 impl RateBudget {
     /// Production budget: waits up to 1.1 s (one second-boundary rotation)
     /// before failing with `BudgetExceeded`.
+    ///
+    /// Deliberately does NOT delegate to [`Self::new_for_tests`]: the test
+    /// constructor freezes the window clock (`last_second: u64::MAX`),
+    /// which would disable rotation for the real budget too.
     pub fn new(cap: u32) -> Self {
-        Self::new_for_tests(cap, Duration::from_millis(1100))
+        Self {
+            cap,
+            state: Mutex::new(BudgetState {
+                buckets: [0; WINDOW_BUCKETS],
+                last_second: 0,
+            }),
+            acquire_wait: Duration::from_millis(1100),
+        }
     }
 
     /// Test constructor: explicit `acquire_wait` (zero → fail immediately
-    /// when the window is full, no sleeps).
+    /// when the window is full, no sleeps) **with a frozen window clock**.
+    ///
+    /// The `last_second: u64::MAX` seed makes `advance()`'s
+    /// `now_second <= *last` early-return fire on every acquire, so the
+    /// ring can never rotate mid-test: a cap-1 budget whose two acquires
+    /// happen to straddle a minute boundary would otherwise hit the
+    /// whole-ring reset and let the blocked request through (a rare but
+    /// real clock flake). Rotation itself is unit-covered by
+    /// `rate_budget_window_rotates` over the pure `advance` helper.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn new_for_tests(cap: u32, acquire_wait: Duration) -> Self {
@@ -581,7 +600,7 @@ impl RateBudget {
             cap,
             state: Mutex::new(BudgetState {
                 buckets: [0; WINDOW_BUCKETS],
-                last_second: 0,
+                last_second: u64::MAX,
             }),
             acquire_wait,
         }

@@ -1153,6 +1153,9 @@ mod tests {
         .expect_err("a mint-side 429 must fail the dispatch");
         assert!(err.contains("auth error"), "got: {err}");
         assert!(err.contains("token churn"), "got: {err}");
+        // The token endpoint's Trace-Id must reach the report (the
+        // "Trace-Id in all error paths" bullet, auth-surface twin).
+        assert!(err.contains("Trace-Id: tr-mint-429"), "got: {err}");
 
         assert_eq!(
             count_hits(&mock_server, "/auth/oauth/token").await,
