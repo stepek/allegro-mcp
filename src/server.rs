@@ -9,6 +9,7 @@ use std::sync::Arc;
 /// Holds a read-only [`crate::tool_registry::ToolRegistry`] built once at
 /// startup, a shared [`crate::auth::AllegroAuth`] token manager, and a
 /// reusable [`reqwest::Client`] for connection pooling across tool calls.
+#[derive(Clone)]
 pub struct AllegroServer {
     registry: Arc<crate::tool_registry::ToolRegistry>,
     auth: Arc<crate::auth::AllegroAuth>,
@@ -61,6 +62,18 @@ impl AllegroServer {
     pub fn with_api_base_url(mut self, api_base_url: String) -> Self {
         self.api_base_url = Some(api_base_url);
         self
+    }
+
+    /// Returns a shared handle to the auth manager backing this server.
+    ///
+    /// Used by the HTTP transport (`src/http_server.rs`) to back the
+    /// `/auth/status` endpoint with the *same* token cache the dispatcher
+    /// uses, instead of constructing a second, independent `AllegroAuth`
+    /// whose cache would silently diverge from the one actually used for API
+    /// calls.
+    #[doc(hidden)]
+    pub fn auth_handle(&self) -> Arc<crate::auth::AllegroAuth> {
+        self.auth.clone()
     }
 }
 
@@ -351,5 +364,21 @@ mod tests {
         // Must not panic for either value.
         let _prod = make_server(false);
         let _sandbox = make_server(true);
+    }
+
+    #[test]
+    fn test_allegro_server_is_clone() {
+        let registry = crate::tool_registry::ToolRegistry::from_openapi(
+            &serde_yaml::from_str::<openapiv3::OpenAPI>(
+                "openapi: \"3.0.3\"\ninfo:\n  title: t\n  version: v\npaths: {}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let auth = crate::auth::AllegroAuth::new("id".to_string(), "secret".to_string(), false);
+        let server = AllegroServer::new(registry, auth, false);
+        let cloned = server.clone();
+        // Both handles must point at the same underlying auth cache.
+        assert!(Arc::ptr_eq(&server.auth_handle(), &cloned.auth_handle()));
     }
 }

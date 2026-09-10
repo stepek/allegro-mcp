@@ -294,6 +294,49 @@ impl AllegroAuth {
         );
         Ok(token_resp)
     }
+
+    /// Returns a snapshot of the current token-cache state without
+    /// triggering a fetch or refresh — a read-only status check, safe to call
+    /// from an unauthenticated-by-default endpoint (it reveals cache
+    /// freshness, never the token itself).
+    pub async fn status(&self) -> AuthStatus {
+        let guard = self.cache.read().await;
+        match guard.as_ref() {
+            Some(cached) => AuthStatus {
+                auth_flow: "client_credentials",
+                token_cached: true,
+                token_valid: cached.is_valid(),
+                expires_in_secs: cached
+                    .expires_at
+                    .checked_duration_since(Instant::now())
+                    .map(|d| d.as_secs()),
+            },
+            None => AuthStatus {
+                auth_flow: "client_credentials",
+                token_cached: false,
+                token_valid: false,
+                expires_in_secs: None,
+            },
+        }
+    }
+}
+
+/// A point-in-time snapshot of the token cache, for the `/auth/status`
+/// HTTP endpoint (admin visibility — see `src/http_server.rs`). Never
+/// exposes the token itself.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuthStatus {
+    /// Always `"client_credentials"` today — this crate does not
+    /// implement a device-authorization / user-consent flow yet.
+    pub auth_flow: &'static str,
+    /// `true` once at least one token fetch has succeeded since process
+    /// start (the in-memory cache is never persisted to disk today).
+    pub token_cached: bool,
+    /// `true` when the cached token still has > 60 s remaining (the same
+    /// threshold `token()` uses to decide whether to refresh).
+    pub token_valid: bool,
+    /// Seconds remaining before expiry, if a token is cached.
+    pub expires_in_secs: Option<u64>,
 }
 
 #[cfg(test)]
@@ -564,5 +607,32 @@ mod tests {
             err.to_string(),
             "missing environment variable: ALLEGRO_CLIENT_SECRET"
         );
+    }
+
+    #[tokio::test]
+    async fn status_reports_no_token_before_first_fetch() {
+        let auth = AllegroAuth::new("id".to_owned(), "secret".to_owned(), false);
+        let status = auth.status().await;
+        assert!(!status.token_cached);
+        assert!(!status.token_valid);
+        assert_eq!(status.expires_in_secs, None);
+        assert_eq!(status.auth_flow, "client_credentials");
+    }
+
+    #[tokio::test]
+    async fn status_reports_valid_token_after_seeding_cache() {
+        let auth = AllegroAuth::new("id".to_owned(), "secret".to_owned(), false);
+        {
+            let mut guard = auth.cache.write().await;
+            *guard = Some(CachedToken {
+                access_token: "tok".to_owned(),
+                expires_at: Instant::now() + Duration::from_secs(3600),
+            });
+        }
+        let status = auth.status().await;
+        assert!(status.token_cached);
+        assert!(status.token_valid);
+        assert!(status.expires_in_secs.is_some());
+        assert_eq!(status.auth_flow, "client_credentials");
     }
 }

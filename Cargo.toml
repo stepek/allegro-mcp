@@ -18,7 +18,10 @@ path = "src/lib.rs"
 
 [dependencies]
 # MCP SDK — official Rust implementation
-rmcp            = { version = "3.2.0", features = ["server", "transport-io"] }
+rmcp            = { version = "3.2.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
+
+# HTTP transport for the Streamable HTTP MCP server (Phase 12)
+axum            = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
 # OpenAPI schema parsing
 openapiv3       = "2.2.0"
