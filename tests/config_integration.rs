@@ -51,6 +51,7 @@ const LOAD_ENV_VARS: &[(&str, Option<&str>)] = &[
     ("ALLEGRO_MCP_SCHEMA_URL", None),
     ("ALLEGRO_MCP_SCHEMA_FILE", None),
     ("ALLEGRO_MCP_CONFIG", None),
+    ("ALLEGRO_MCP_RATE_LIMIT", None),
 ];
 
 fn write_config(dir: &Path, contents: &str) -> PathBuf {
@@ -237,6 +238,7 @@ fn load_env_overrides_config_file() {
             ("ALLEGRO_MCP_CONFIG", None),
             ("ALLEGRO_MCP_SCHEMA_URL", None),
             ("ALLEGRO_MCP_SCHEMA_FILE", None),
+            ("ALLEGRO_MCP_RATE_LIMIT", None),
         ],
         || {
             let cfg = Config::load(&cli_with_config(&path)).expect("load");
@@ -265,6 +267,7 @@ fn load_invalid_sandbox_env_value_aborts() {
             ("ALLEGRO_MCP_CONFIG", None),
             ("ALLEGRO_MCP_SCHEMA_URL", None),
             ("ALLEGRO_MCP_SCHEMA_FILE", None),
+            ("ALLEGRO_MCP_RATE_LIMIT", None),
         ],
         || {
             let err =
@@ -291,6 +294,7 @@ fn load_user_agent_env_is_trimmed() {
             ("ALLEGRO_MCP_CONFIG", None),
             ("ALLEGRO_MCP_SCHEMA_URL", None),
             ("ALLEGRO_MCP_SCHEMA_FILE", None),
+            ("ALLEGRO_MCP_RATE_LIMIT", None),
         ],
         || {
             let cfg = Config::load(&CliOverrides::default()).expect("trimmed UA must load");
@@ -328,6 +332,7 @@ fn load_cli_beats_env_beats_file_for_sandbox_and_ua() {
             ("ALLEGRO_MCP_CONFIG", None),
             ("ALLEGRO_MCP_SCHEMA_URL", None),
             ("ALLEGRO_MCP_SCHEMA_FILE", None),
+            ("ALLEGRO_MCP_RATE_LIMIT", None),
         ],
         || {
             // CLI overrides both env and file.
@@ -391,6 +396,7 @@ fn load_schema_source_resolution_env_url_beats_config_file() {
             ("ALLEGRO_MCP_ACCEPT_LANGUAGE", None),
             ("ALLEGRO_MCP_CONFIG", None),
             ("ALLEGRO_MCP_SCHEMA_FILE", None),
+            ("ALLEGRO_MCP_RATE_LIMIT", None),
         ],
         || {
             let cfg = Config::load(&cli_with_config(&path)).expect("load");
@@ -422,6 +428,7 @@ fn load_uses_env_discovered_config_file() {
             ("ALLEGRO_MCP_ACCEPT_LANGUAGE", None),
             ("ALLEGRO_MCP_SCHEMA_URL", None),
             ("ALLEGRO_MCP_SCHEMA_FILE", None),
+            ("ALLEGRO_MCP_RATE_LIMIT", None),
         ],
         || {
             let cfg = Config::load(&CliOverrides::default()).expect("load");
@@ -430,6 +437,123 @@ fn load_uses_env_discovered_config_file() {
                 "settings must come from the env-discovered file"
             );
             assert_eq!(cfg.accept_language, "en-US");
+        },
+    );
+}
+
+// ── [resilience] rate-limit knob (Phase 9) ────────────────────────────────────
+
+#[test]
+#[serial]
+fn load_resilience_section_parses_rate_limit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_config(dir.path(), "[resilience]\nrate_limit_per_minute = 100\n");
+
+    with_env(LOAD_ENV_VARS, || {
+        let cfg = Config::load(&cli_with_config(&path)).expect("load must succeed");
+        assert_eq!(cfg.rate_limit_rpm(), 100);
+    });
+}
+
+#[test]
+#[serial]
+fn load_resilience_defaults_to_8000_without_the_section() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_config(dir.path(), "sandbox = true\n");
+
+    with_env(LOAD_ENV_VARS, || {
+        let cfg = Config::load(&cli_with_config(&path)).expect("load must succeed");
+        assert_eq!(
+            cfg.rate_limit_rpm(),
+            8000,
+            "soft cap default, under the 9000 hard limit"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn load_resilience_invalid_value_aborts() {
+    for bad in ["9000", "99999"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            &format!("[resilience]\nrate_limit_per_minute = {bad}\n"),
+        );
+
+        with_env(LOAD_ENV_VARS, || {
+            let err = Config::load(&cli_with_config(&path))
+                .expect_err("values >= 9000 must abort startup");
+            assert!(
+                matches!(err, ConfigError::InvalidRateLimit { value } if value.to_string() == bad),
+                "expected InvalidRateLimit({bad}), got: {err:?}"
+            );
+        });
+    }
+}
+
+#[test]
+#[serial]
+fn load_resilience_zero_disables_the_guard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_config(dir.path(), "[resilience]\nrate_limit_per_minute = 0\n");
+
+    with_env(LOAD_ENV_VARS, || {
+        let cfg = Config::load(&cli_with_config(&path)).expect("0 is explicitly legal");
+        assert_eq!(cfg.rate_limit_rpm(), 0, "0 disables the budget guard");
+    });
+}
+
+#[test]
+#[serial]
+fn env_override_sets_rate_limit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_config(dir.path(), "[resilience]\nrate_limit_per_minute = 100\n");
+
+    with_env(
+        &[
+            ("ALLEGRO_MCP_RATE_LIMIT", Some("250")),
+            ("ALLEGRO_MCP_SANDBOX", None),
+            ("ALLEGRO_MCP_USER_AGENT", None),
+            ("ALLEGRO_MCP_ACCEPT_LANGUAGE", None),
+            ("ALLEGRO_MCP_CONFIG", None),
+            ("ALLEGRO_MCP_SCHEMA_URL", None),
+            ("ALLEGRO_MCP_SCHEMA_FILE", None),
+        ],
+        || {
+            let cfg = Config::load(&cli_with_config(&path)).expect("load must succeed");
+            assert_eq!(
+                cfg.rate_limit_rpm(),
+                250,
+                "env ALLEGRO_MCP_RATE_LIMIT must beat the file value"
+            );
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn env_override_garbage_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_config(dir.path(), "sandbox = true\n");
+
+    with_env(
+        &[
+            ("ALLEGRO_MCP_RATE_LIMIT", Some("fast")),
+            ("ALLEGRO_MCP_SANDBOX", None),
+            ("ALLEGRO_MCP_USER_AGENT", None),
+            ("ALLEGRO_MCP_ACCEPT_LANGUAGE", None),
+            ("ALLEGRO_MCP_CONFIG", None),
+            ("ALLEGRO_MCP_SCHEMA_URL", None),
+            ("ALLEGRO_MCP_SCHEMA_FILE", None),
+        ],
+        || {
+            let err = Config::load(&cli_with_config(&path))
+                .expect_err("non-numeric env values must abort, never silently default");
+            assert!(
+                matches!(&err, ConfigError::InvalidEnv { var, .. } if *var == "ALLEGRO_MCP_RATE_LIMIT"),
+                "expected InvalidEnv(ALLEGRO_MCP_RATE_LIMIT), got: {err:?}"
+            );
         },
     );
 }

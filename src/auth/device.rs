@@ -125,6 +125,15 @@ pub enum DeviceFlowError {
 /// The body is read **before** any status check: the 400 bodies carry the
 /// taxonomy, and `error_for_status()` would discard them.
 pub fn classify(status: u16, body: &str) -> PollOutcome {
+    if status == 429 {
+        // Transient rate limit — polling faster must not read as a dead
+        // grant (Phase 9: it used to fall into the terminal
+        // `ExpiredOrInvalid` 4xx branch). Bounded by the existing
+        // 5-transient cap; no Retry-After honoring here — this loop's
+        // interval contract belongs to the device-grant
+        // `interval`/`slow_down` protocol.
+        return PollOutcome::Transient(format!("HTTP 429: {body}"));
+    }
     if (400..500).contains(&status) {
         return classify_error_body(body);
     }
@@ -694,6 +703,18 @@ mod tests {
         assert!(
             matches!(outcome, PollOutcome::Transient(_)),
             "5xx must be transient, got {outcome:?}"
+        );
+    }
+
+    /// Phase 9: a poll 429 is a transient rate limit — it used to land in
+    /// the 4xx range check and read as a terminal `ExpiredOrInvalid`,
+    /// killing an interactive `auth device` run on a hiccup.
+    #[test]
+    fn classify_429_is_transient_not_expired_or_invalid() {
+        let outcome = classify(429, r#"{"error":"slow_down"}"#);
+        assert!(
+            matches!(outcome, PollOutcome::Transient(_)),
+            "429 must be transient, got {outcome:?}"
         );
     }
 

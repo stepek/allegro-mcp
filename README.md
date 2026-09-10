@@ -133,6 +133,56 @@ The runtime image is distroless (no shell) — the Portainer "Console" tab
 cannot be used; the container logs and the browser approval are all
 that's needed.
 
+## Resilience & error reporting
+
+allegro-mcp is a good Allegro citizen on the wire and fails loudly but
+cleanly. Every tool call runs through one resilience loop:
+
+| Condition | Behavior |
+|---|---|
+| `429 Too Many Requests` | Exponential backoff **+ jitter**, up to **3 retries** (500 ms → 1 s → 2 s, capped at 30 s). A server-sent `Retry-After` replaces the computed delay (clamped to 30 s — a tool call never hangs minutes). Retried for **every** method: a 429 means the request was rejected before processing. |
+| `5xx` server error | **Single retry**, idempotent methods only (`GET`/`HEAD`/`PUT`/`DELETE`) — a replayed POST could create a duplicate offer. |
+| `401 Unauthorized` | One forced token re-resolution (device flow: the single-use refresh grant) + re-send — Phase 5 semantics, unchanged. |
+| Token-mint `429` | **Never auto-retried.** Surfaces immediately as an actionable *"token churn too high"* error — hammering the token endpoint would make it worse. |
+| Network / transport error | Clear **"Allegro could not be reached"** message instead of reqwest's raw transport noise. |
+| Rate-limit budget | Client-side sliding 60 s window keeps the process under a soft cap (default **8000 req/min**, ~11 % headroom under Allegro's 9000/min per-`client_id` quota). Past the cap the call fails fast with a *"paused itself to protect your Allegro quota"* error. |
+
+Every API error is reported as structured text with a dev line, a
+user-friendly line, and — when Allegro sent one — the response's
+`Trace-Id`:
+
+```text
+Allegro API error: HTTP 429 Too Many Requests — rate limited after 4 attempts
+Trace-Id: 1311db4f-fe65-4cb2-b514-1bb47f781aa7
+Retry-After: 30s
+Dev: 429; retries exhausted (backoff 500ms/1s/2s + jitter, server Retry-After honored); body: {"errors":[…]}
+User: Allegro is limiting how often this app can call the API. Wait a moment and retry; if it persists, reduce how many requests you make at once.
+```
+
+Allegro error bodies (`{"errors":[{code,message,userMessage,path}]}`) and
+OAuth token-endpoint errors (`{error,error_description}`) are mapped into
+those dev + user lines automatically.
+
+> 💡 **When contacting Allegro support, include the `Trace-Id:` line** —
+> it is the correlation key their support asks for.
+
+### Configuring the rate budget
+
+```toml
+# allegro-mcp.toml
+[resilience]
+rate_limit_per_minute = 8000   # default; 0 disables the guard; must be < 9000
+```
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `ALLEGRO_MCP_RATE_LIMIT` | Overrides `rate_limit_per_minute` | `8000` |
+
+The budget is per process (= per `client_id` in every supported
+deployment). Running **multiple instances behind one `client_id`**? Lower
+the per-instance cap accordingly — the guard does not coordinate across
+processes.
+
 ## Key design decisions
 
 | # | Decision | Why |

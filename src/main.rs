@@ -5,6 +5,7 @@ mod config;
 mod dispatcher;
 mod http;
 mod http_server;
+mod resilience;
 mod schema;
 mod server;
 mod tool_registry;
@@ -169,6 +170,7 @@ async fn main() -> Result<()> {
         auth_flow = ?cfg.auth_flow,
         token_path = ?cfg.token_path,
         tools_filters = ?cfg.tools,
+        rate_limit_rpm = cfg.rate_limit_rpm(),
         "allegro-mcp starting"
     );
 
@@ -427,8 +429,9 @@ async fn build_allegro_server(
     // Cheap clone (Arc internals) — the device resume task must reuse the
     // config-driven client (ToS-compliant UA), never a bare default one.
     let api_client_for_resume = api_client.clone();
-    let server =
-        server::AllegroServer::new(registry, auth, cfg.sandbox).with_http_client(api_client);
+    let server = server::AllegroServer::new(registry, auth, cfg.sandbox)
+        .with_http_client(api_client)
+        .with_resilience(resilience::Resilience::production(cfg.rate_limit_rpm()));
 
     // Device-mode startup policy (shared by both transports): restore the
     // persisted authorization, resume an unexpired pending grant in the

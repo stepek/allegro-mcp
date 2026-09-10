@@ -63,6 +63,15 @@ pub enum ConfigError {
     /// A `scopes` entry would corrupt the space-joined OAuth2 `scope` param.
     #[error("invalid scope entry {value:?}: {reason}")]
     InvalidScopes { value: String, reason: String },
+
+    /// `[resilience] rate_limit_per_minute` outside the legal range — the
+    /// soft cap must stay under Allegro's 9000/min hard limit (or be 0,
+    /// disabling the guard).
+    #[error(
+        "invalid rate_limit_per_minute {value}: must be 0 (disabled) or 1..=8999 \
+         — Allegro's hard limit is 9000/min"
+    )]
+    InvalidRateLimit { value: u32 },
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -102,6 +111,24 @@ pub struct ToolFilters {
     /// Denied tool-name prefixes — see [`Self::allow`].
     #[allow(dead_code)]
     pub deny: Vec<String>,
+}
+
+/// `[resilience]` table — client-side protections (Phase 9).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResilienceConfig {
+    /// Soft per-minute request cap per client_id. `0` disables the guard.
+    /// Must stay under Allegro's 9000/min hard limit — validated in
+    /// [`Config::validate`].
+    pub rate_limit_per_minute: u32,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_per_minute: crate::resilience::DEFAULT_RATE_LIMIT_RPM,
+        }
+    }
 }
 
 /// The effective server configuration.
@@ -144,6 +171,11 @@ pub struct Config {
     pub token_path: Option<PathBuf>,
     /// Tool filters — parsed now, consumed in Phase 10.
     pub tools: Option<ToolFilters>,
+    /// Client-side resilience protections (Phase 9). Plain field, not
+    /// `Option` — it is consumed this phase; the container-level
+    /// `#[serde(default)]` on [`Config`] keeps partial files valid.
+    #[serde(default)]
+    pub resilience: ResilienceConfig,
 }
 
 impl Default for Config {
@@ -158,6 +190,7 @@ impl Default for Config {
             scopes: Vec::new(),
             token_path: None,
             tools: None,
+            resilience: ResilienceConfig::default(),
         }
     }
 }
@@ -443,6 +476,12 @@ impl Config {
                 };
             }
         }
+        // Client-side rate budget override (Phase 9): env beats the config
+        // file's `[resilience] rate_limit_per_minute`. Garbage never
+        // silently defaults — `parse_env_u32` errors out.
+        if let Ok(v) = std::env::var("ALLEGRO_MCP_RATE_LIMIT") {
+            cfg.resilience.rate_limit_per_minute = parse_env_u32("ALLEGRO_MCP_RATE_LIMIT", &v)?;
+        }
         // URL before FILE so that, when both env vars are set, the file wins
         // (env file > env url); each step clears the opposite field because a
         // higher layer's source choice shadows everything below it.
@@ -514,7 +553,20 @@ impl Config {
                 });
             }
         }
+        // Client-side rate budget: 0 disables; anything else must stay
+        // strictly under Allegro's 9000/min per-client_id hard limit.
+        let rpm = self.resilience.rate_limit_per_minute;
+        if !(rpm == 0 || (1..crate::resilience::ALLEGRO_HARD_LIMIT_RPM).contains(&rpm)) {
+            return Err(ConfigError::InvalidRateLimit { value: rpm });
+        }
         Ok(())
+    }
+
+    /// The effective client-side rate cap (requests/minute per client_id);
+    /// `0` means the budget guard is disabled. Consumed by
+    /// `build_allegro_server` when wiring `resilience::Resilience`.
+    pub fn rate_limit_rpm(&self) -> u32 {
+        self.resilience.rate_limit_per_minute
     }
 
     /// Full loading pipeline: file (discovered or explicit) → env → CLI →
@@ -562,6 +614,21 @@ fn parse_env_bool(var: &'static str, value: &str) -> Result<bool, ConfigError> {
             value: value.to_owned(),
         }),
     }
+}
+
+/// Parses an `ALLEGRO_MCP_RATE_LIMIT`-style u32 (surrounding whitespace
+/// tolerated, same hygiene as [`parse_env_bool`]). Anything else —
+/// negatives, floats, garbage — is [`ConfigError::InvalidEnv`], never a
+/// silent default.
+fn parse_env_u32(var: &'static str, value: &str) -> Result<u32, ConfigError> {
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| ConfigError::InvalidEnv {
+            var,
+            expected: "a non-negative integer",
+            value: value.to_owned(),
+        })
 }
 
 #[cfg(test)]
@@ -1353,5 +1420,103 @@ mod tests {
             ..Config::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── [resilience] rate-limit knob (Phase 9) ───────────────────────────────
+
+    #[test]
+    fn resilience_defaults_to_8000_rpm() {
+        assert_eq!(
+            Config::default().rate_limit_rpm(),
+            crate::resilience::DEFAULT_RATE_LIMIT_RPM
+        );
+        assert_eq!(
+            Config::from_toml_str("")
+                .expect("empty file → defaults")
+                .rate_limit_rpm(),
+            8000,
+            "a TOML-less run must default to the 8000/min soft cap"
+        );
+    }
+
+    #[test]
+    fn resilience_rate_limit_parses() {
+        let cfg = Config::from_toml_str("[resilience]\nrate_limit_per_minute = 100\n")
+            .expect("[resilience] must parse");
+        assert_eq!(cfg.rate_limit_rpm(), 100);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn resilience_zero_disables_the_guard() {
+        let cfg = Config::from_toml_str("[resilience]\nrate_limit_per_minute = 0\n")
+            .expect("0 must parse (guard disabled)");
+        assert_eq!(cfg.rate_limit_rpm(), 0);
+        assert!(cfg.validate().is_ok(), "0 is explicitly legal");
+    }
+
+    #[test]
+    fn resilience_at_hard_limit_is_rejected() {
+        for bad in [9000u32, 99999] {
+            let cfg = Config {
+                resilience: ResilienceConfig {
+                    rate_limit_per_minute: bad,
+                },
+                ..Config::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err(&format!("{bad} must be rejected"));
+            assert!(
+                matches!(err, ConfigError::InvalidRateLimit { value } if value == bad),
+                "expected InvalidRateLimit({bad}), got: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("9000"),
+                "the message must name the hard limit: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resilience_unknown_key_is_hard_error() {
+        let err = Config::from_toml_str("[resilience]\nrate_limit = 100\n")
+            .expect_err("typo'd key under [resilience] must be rejected");
+        assert!(
+            matches!(&err, ConfigError::UnknownKey { key, .. } if key == "rate_limit"),
+            "expected UnknownKey(rate_limit), got: {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_env_rate_limit_override() {
+        with_env(&[("ALLEGRO_MCP_RATE_LIMIT", Some("100"))], || {
+            let mut cfg = Config::default();
+            Config::apply_env(&mut cfg).expect("valid u32 must apply");
+            assert_eq!(cfg.rate_limit_rpm(), 100, "env must beat the default");
+        });
+        // Surrounding whitespace is tolerated (same hygiene as the bools).
+        with_env(&[("ALLEGRO_MCP_RATE_LIMIT", Some(" 250 "))], || {
+            let mut cfg = Config::default();
+            Config::apply_env(&mut cfg).expect("trimmed u32 must apply");
+            assert_eq!(cfg.rate_limit_rpm(), 250);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn apply_env_rate_limit_garbage_errors() {
+        with_env(&[("ALLEGRO_MCP_RATE_LIMIT", Some("fast"))], || {
+            let mut cfg = Config::default();
+            let err = Config::apply_env(&mut cfg).expect_err("garbage must be rejected");
+            assert!(
+                matches!(&err, ConfigError::InvalidEnv { var, value, .. } if *var == "ALLEGRO_MCP_RATE_LIMIT" && value == "fast"),
+                "expected InvalidEnv, got: {err:?}"
+            );
+            // Never silently defaulted.
+            assert_eq!(cfg.rate_limit_rpm(), 8000);
+        });
     }
 }

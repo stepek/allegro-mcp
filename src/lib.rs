@@ -4,6 +4,7 @@ pub mod config;
 pub mod dispatcher;
 pub mod http;
 pub mod http_server;
+pub mod resilience;
 pub mod schema;
 pub mod server;
 pub mod tool_registry;

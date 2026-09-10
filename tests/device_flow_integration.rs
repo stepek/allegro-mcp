@@ -813,8 +813,14 @@ async fn stale_store_guard_transient_retry_failure_keeps_the_newer_pair() {
         .refresh_now()
         .await
         .expect_err("a transient retry failure must propagate");
+    // Phase 9 re-typed mint-path HTTP errors: a 5xx from the token
+    // endpoint surfaces as `AuthError::TokenEndpoint { status: 500, .. }`
+    // (pre-Phase 9: `AuthError::Http` via `error_for_status`), which is
+    // transient — `is_definitive_rejection` matches only 4xx — so the
+    // error must still propagate as-is instead of being swallowed into a
+    // store wipe.
     assert!(
-        matches!(err, AuthError::Http(_)),
+        matches!(err, AuthError::TokenEndpoint { status: 500, .. }),
         "the transient error must propagate as-is (not be swallowed into a store wipe), got: {err:?}"
     );
 

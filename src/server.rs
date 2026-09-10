@@ -18,12 +18,18 @@ pub struct AllegroServer {
     /// Override for the Allegro API base URL. `None` means use the default
     /// derived from `sandbox`. Set via [`Self::with_api_base_url`] in tests.
     api_base_url: Option<String>,
+    /// Phase 9 resilience bundle: backoff policy + the shared client-side
+    /// rate budget. `Resilience: Clone` keeps the derived server `Clone`
+    /// working; clones share the single budget via `Arc`.
+    resilience: crate::resilience::Resilience,
 }
 
 impl AllegroServer {
     /// Constructs a new [`AllegroServer`] from an already-built registry and
     /// auth manager. Uses the default (ToS-compliant UA) pooled client; pass
-    /// a config-driven one via [`Self::with_http_client`].
+    /// a config-driven one via [`Self::with_http_client`]. The resilience
+    /// bundle defaults to the 8000/min soft budget; `main` refines it from
+    /// config via [`Self::with_resilience`].
     pub fn new(
         registry: crate::tool_registry::ToolRegistry,
         auth: crate::auth::AllegroAuth,
@@ -35,6 +41,9 @@ impl AllegroServer {
             http: crate::http::default_client(),
             sandbox,
             api_base_url: None,
+            resilience: crate::resilience::Resilience::production(
+                crate::resilience::DEFAULT_RATE_LIMIT_RPM,
+            ),
         }
     }
 
@@ -61,6 +70,20 @@ impl AllegroServer {
     #[allow(dead_code)]
     pub fn with_api_base_url(mut self, api_base_url: String) -> Self {
         self.api_base_url = Some(api_base_url);
+        self
+    }
+
+    /// Replaces the resilience bundle (backoff policy + shared rate
+    /// budget). `main` wires the config-driven
+    /// `Resilience::production(cfg.rate_limit_rpm())` here; integration
+    /// tests inject `Resilience::test_instant()`.
+    ///
+    /// Same visibility rationale as [`Self::with_api_base_url`]: `pub` for
+    /// the integration tests under `tests/`, `#[doc(hidden)]` to keep it
+    /// out of the public docs.
+    #[doc(hidden)]
+    pub fn with_resilience(mut self, res: crate::resilience::Resilience) -> Self {
+        self.resilience = res;
         self
     }
 
@@ -141,13 +164,23 @@ impl rmcp::ServerHandler for AllegroServer {
 
         let arguments = request.arguments.unwrap_or_default();
 
-        let dispatch_result = if let Some(ref base) = self.api_base_url {
-            crate::dispatcher::dispatch_with_base(&self.auth, &self.http, base, tool_def, arguments)
-                .await
-        } else {
-            crate::dispatcher::dispatch(&self.auth, &self.http, self.sandbox, tool_def, arguments)
-                .await
-        };
+        // Phase 9: everything flows through the resilience dispatch (retry
+        // loop + budget + structured error reports); the config-driven
+        // budget hangs off `self.resilience`, wired in `main`.
+        let base = self
+            .api_base_url
+            .as_deref()
+            .unwrap_or_else(|| crate::config::api_base_url(self.sandbox));
+        let dispatch_result = crate::dispatcher::dispatch_with_resilience(
+            &self.auth,
+            &self.http,
+            base,
+            tool_def,
+            arguments,
+            &self.resilience,
+        )
+        .await
+        .map_err(|e| e.report());
 
         match dispatch_result {
             Ok(body) => Ok(rmcp::model::CallToolResponse::Complete(
