@@ -138,6 +138,23 @@ pub fn classify(status: u16, body: &str) -> PollOutcome {
     }
 }
 
+/// Truncates `body` to at most `max` bytes at a UTF-8 char boundary.
+///
+/// Remote 4xx bodies are attacker-controlled and routinely non-ASCII (HTML
+/// error pages); a bare `&body[..max]` would panic when byte `max` lands
+/// inside a multibyte codepoint, so walk back to the nearest boundary (same
+/// pattern as `dispatcher::truncate_body`).
+fn truncate_for_log(body: &str, max: usize) -> &str {
+    if body.len() <= max {
+        return body;
+    }
+    let mut pos = max;
+    while pos > 0 && !body.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    &body[..pos]
+}
+
 /// `4xx` bodies: `{"error": "<code>"}` where the code picks the branch.
 /// Per Allegro's docs, *any* unrecognized 4xx error code means "codes
 /// expired or your request is malformed" → terminal, not retryable.
@@ -163,7 +180,7 @@ fn classify_error_body(body: &str) -> PollOutcome {
         }
         None => {
             tracing::debug!(
-                body = &body[..body.len().min(200)],
+                body = truncate_for_log(body, 200),
                 "device poll: 4xx without a parseable error field"
             );
             PollOutcome::ExpiredOrInvalid
@@ -635,6 +652,38 @@ mod tests {
             classify(400, "<html>bad gateway</html>"),
             PollOutcome::ExpiredOrInvalid
         ));
+    }
+
+    /// A multibyte 4xx body whose byte 200 falls *inside* a codepoint must
+    /// not panic the debug-log truncation (remote-controlled input — an
+    /// HTML error page full of non-ASCII is a realistic 4xx body).
+    #[test]
+    fn classify_multibyte_4xx_body_does_not_panic() {
+        // 'ł' is 2 bytes in UTF-8: byte 200 of this body splits a codepoint.
+        let body = "ł".repeat(300);
+        assert!(matches!(
+            classify(400, &body),
+            PollOutcome::ExpiredOrInvalid
+        ));
+    }
+
+    #[test]
+    fn truncate_for_log_stays_on_char_boundaries() {
+        // Byte 200 is the second byte of a 2-byte 'ą' → floor back to the
+        // nearest boundary (byte 199).
+        let body = format!("{}ą{}", "x".repeat(199), "y".repeat(50));
+        let truncated = truncate_for_log(&body, 200);
+        assert!(truncated.len() <= 200);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(body.starts_with(truncated));
+
+        // An ASCII body truncates at exactly the cap.
+        assert_eq!(truncate_for_log(&"a".repeat(300), 200), "a".repeat(200));
+
+        // Short bodies pass through untouched.
+        assert_eq!(truncate_for_log("short", 200), "short");
+        // A cap of 0 yields the empty slice — never a panic.
+        assert_eq!(truncate_for_log("abc", 0), "");
     }
 
     #[test]

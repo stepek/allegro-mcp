@@ -502,10 +502,11 @@ part of the same commit — or add the `mod` lines immediately).
 - [x] 5.1 Restructure `dispatch_with_base`: hoist method/url/params/accept
   computation above a local closure `let build = |token: &str| builder…`;
   send once; if `status == StatusCode::UNAUTHORIZED`:
-  `auth.invalidate().await` → `auth.token().await` → rebuild → retry
-  **once**. If the retry also fails, return the retry's error (the original
-  401 body is less interesting than the post-refresh one). Non-401 errors
-  behave exactly as today.
+  `auth.refresh_now().await` → rebuild → retry **once** (post-review fix —
+  the original `invalidate()` + `token()` mechanism was a no-op in device
+  mode, see the fix note under this phase). If the retry also fails,
+  return the retry's error (the original 401 body is less interesting
+  than the post-refresh one). Non-401 errors behave exactly as today.
 - [x] 5.2 Rationale comment: device tokens are user-scoped and die
   out-of-band (password change, app unlink, 20-session cap — §0.3); the
   60 s pre-expiry refresh cannot see those, so the 401 hook is the only
@@ -515,6 +516,37 @@ part of the same commit — or add the `mod` lines immediately).
   hits; API always 401 → `Err` containing the second body; auth failure on
   the re-resolve → `Err` with `auth error` prefix.
 - [x] 5.4 Commit: `feat(dispatcher): single 401 retry with token re-resolution (#5)`
+
+### Post-review fix — forced refresh grant on 401 (deviation from 4.6/5.1 as originally written)
+
+Review blocker: the original 5.1 mechanism was a no-op in device mode. An
+out-of-band revocation never changes the stored token's `expires_at_epoch`,
+so `invalidate()` + `token()` re-resolved to the byte-identical dead token
+and no refresh happened until the 12 h expiry lapsed — contradicting 5.2's
+own rationale. Final design (supersedes the 4.6 `refresh_now` bullet):
+
+- `AllegroAuth` carries a one-shot `force_refresh: AtomicBool`.
+  `invalidate()` stays cache-only (restores the persisted pair);
+  `refresh_now()` = invalidate + set the flag + `token()`, now returning
+  the token (`Result<String, AuthError>`) and used by the dispatcher's 401
+  hook — its doc/behavior mismatch is resolved and the `dead_code` allow
+  is gone.
+- `resolve_device_token` consumes the flag: the live-stored-token shortcut
+  (§4.4 step 2) is skipped and the refresh grant runs first; the stored
+  access token remains the fallback only when the refresh fails
+  transiently (5xx / transport) or nothing refreshable is stored; a
+  definitive rejection still clears the store and propagates
+  `ReauthRequired` (which names `allegro-mcp auth device`).
+- Stale-store guard hardening: a *transient* failure of the retried
+  (concurrently rotated) refresh now propagates and keeps the newer pair
+  on disk — only a definitive rejection wipes the file.
+- `src/auth/device.rs`: the 4xx debug-log body truncation is
+  char-boundary-safe (`truncate_for_log`) — a bare byte slice panicked on
+  multibyte remote bodies; unit-tested.
+- `tests/device_flow_integration.rs` §8 rewritten: the 401 must exercise
+  the refresh grant (old refresh in → rotated pair persisted → retry
+  carries the new access token); rejected-refresh-reauth-guidance,
+  transient-fallback, and stale-store-guard transient scenarios added.
 
 ## Phase 6: `src/main.rs` + `src/http_server.rs` — CLI + server wiring — DONE
 

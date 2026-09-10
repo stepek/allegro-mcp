@@ -15,6 +15,8 @@
 //!   always mounted first and the fallback last.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use allegro_mcp::auth::device::{
     poll_for_token, request_device_code, DeviceAuthorizationResponse, DeviceFlowDeps,
@@ -117,6 +119,36 @@ fn seed_expired_pair(store: &TokenStore, refresh: &str) {
         }
     });
     std::fs::write(store.path(), envelope.to_string()).expect("seed expired pair");
+}
+
+/// Seeds a *live* (unexpired) pair with a refresh token — the state a
+/// server would have restored at startup, before anything expires.
+fn seed_live_pair(store: &TokenStore, access: &str, refresh: &str) {
+    let envelope = json!({
+        "version": 1,
+        "env": "production",
+        "tokens": {
+            "access_token": access,
+            "refresh_token": refresh,
+            "expires_at_epoch": epoch_now() + 3600,
+            "scope": "allegro:api:read",
+            "updated_at_epoch": epoch_now()
+        }
+    });
+    std::fs::write(store.path(), envelope.to_string()).expect("seed live pair");
+}
+
+/// A minimal GET tool hitting `/sale/offers`, for the dispatcher tests.
+fn offers_tool() -> ToolDef {
+    ToolDef {
+        id: "allegro_get_offers".to_owned(),
+        name: "allegro_get_offers".to_owned(),
+        description: "List offers".to_owned(),
+        input_schema: json!({}),
+        method: "get".to_owned(),
+        path: "/sale/offers".to_owned(),
+        accept_media_type: None,
+    }
 }
 
 // ── 1. Happy path ─────────────────────────────────────────────────────────────
@@ -474,18 +506,22 @@ async fn refresh_rejection_forces_reauth() {
 
 // ── 8. Dispatcher 401 retry (device-mode end-to-end) ──────────────────────────
 
-/// In device mode the 401 retry re-resolves from the *store* (never a
-/// client_credentials fallback): invalidate the cache → `token()` re-reads
-/// the persisted pair → rebuild the request → succeed. The token endpoint
-/// is therefore never contacted.
+/// In device mode the 401 retry must *force the refresh grant*: the API
+/// just rejected the stored access token out-of-band (revocation, password
+/// change, session cap), and a plain store re-read would hand back the very
+/// token that failed — an out-of-band revocation never changes the stored
+/// `expires_at_epoch`. `refresh_now` skips the stored live token, rotates
+/// the pair through the token endpoint, persists the NEW pair, and the
+/// retried request succeeds with the new access token.
 #[tokio::test]
-async fn dispatcher_retries_once_on_401() {
+async fn dispatcher_401_exercises_the_refresh_grant_and_rotates_the_pair() {
     let mock = MockServer::start().await;
 
-    // Token endpoint must stay silent — device mode never falls back to it.
+    // Token endpoint: the forced refresh grant — old refresh in, rotated
+    // pair out.
     Mock::given(method("POST"))
         .and(path("/auth/oauth/token"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("must never be hit"))
+        .respond_with(ok_token_template("new-access", "new-refresh"))
         .mount(&mock)
         .await;
     // API: 401 exactly once, then 200 (limited mock mounted FIRST).
@@ -503,38 +539,18 @@ async fn dispatcher_retries_once_on_401() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let store = store_in(dir.path());
-    // Seed the restored session the server would have loaded at startup.
-    let envelope = json!({
-        "version": 1,
-        "env": "production",
-        "tokens": {
-            "access_token": "tok",
-            "refresh_token": "rfr",
-            "expires_at_epoch": epoch_now() + 3600,
-            "scope": "allegro:api:read",
-            "updated_at_epoch": epoch_now()
-        }
-    });
-    std::fs::write(store.path(), envelope.to_string()).expect("seed live pair");
+    // Seed a *live* pair — the pre-fix bug short-circuited on it and never
+    // contacted the token endpoint.
+    seed_live_pair(&store, "stale-access", "old-refresh");
 
     let auth = AllegroAuth::with_base_url("id".to_owned(), "secret".to_owned(), mock.uri())
         .with_token_store(store_in(dir.path()));
-
-    let tool_def = ToolDef {
-        id: "allegro_get_offers".to_owned(),
-        name: "allegro_get_offers".to_owned(),
-        description: "List offers".to_owned(),
-        input_schema: json!({}),
-        method: "get".to_owned(),
-        path: "/sale/offers".to_owned(),
-        accept_media_type: None,
-    };
 
     let out = dispatch_with_base(
         &auth,
         &reqwest::Client::new(),
         &mock.uri(),
-        &tool_def,
+        &offers_tool(),
         serde_json::Map::new(),
     )
     .await
@@ -542,10 +558,12 @@ async fn dispatcher_retries_once_on_401() {
     assert_eq!(out, "[]");
 
     let reqs = mock.received_requests().await.expect("recorded requests");
+    let api_reqs: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.url.path() == "/sale/offers")
+        .collect();
     assert_eq!(
-        reqs.iter()
-            .filter(|r| r.url.path() == "/sale/offers")
-            .count(),
+        api_reqs.len(),
         2,
         "the API must be hit twice (401 then 200)"
     );
@@ -553,7 +571,256 @@ async fn dispatcher_retries_once_on_401() {
         reqs.iter()
             .filter(|r| r.url.path() == "/auth/oauth/token")
             .count(),
-        0,
-        "device-mode re-resolve reads the store, never the token endpoint"
+        1,
+        "the 401 must be recovered through the refresh grant (exactly one token call)"
     );
+
+    // The refresh grant ran with the OLD refresh token.
+    let refresh_req = reqs
+        .iter()
+        .find(|r| r.url.path() == "/auth/oauth/token")
+        .expect("the refresh grant call");
+    let refresh_body = String::from_utf8_lossy(&refresh_req.body);
+    assert!(
+        refresh_body.contains("grant_type=refresh_token")
+            && refresh_body.contains("refresh_token=old-refresh"),
+        "the 401 recovery must run the refresh grant with the stored token, got: {refresh_body}"
+    );
+
+    // The first attempt carried the stored token, the retry the NEW token.
+    let authz = |r: &wiremock::Request| {
+        r.headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(
+        authz(api_reqs[0]),
+        "Bearer stale-access",
+        "the first attempt carries the stored token"
+    );
+    assert_eq!(
+        authz(api_reqs[1]),
+        "Bearer new-access",
+        "the retry must carry the refreshed token"
+    );
+
+    // The rotated pair is persisted (old refresh token gone).
+    let stored = store_in(dir.path()).load().expect("load store");
+    let saved = stored.tokens.expect("tokens persisted");
+    assert_eq!(saved.access_token, "new-access");
+    assert_eq!(saved.refresh_token.as_deref(), Some("new-refresh"));
+}
+
+/// A *definitively* rejected forced refresh (revoked/expired authorization)
+/// must surface the re-auth guidance — `ReauthRequired` naming
+/// `allegro-mcp auth device` — instead of silently retrying with the dead
+/// token, and wipe the dead pair so the next run starts clean.
+#[tokio::test]
+async fn dispatcher_401_with_rejected_refresh_surfaces_reauth_guidance() {
+    let mock = MockServer::start().await;
+
+    // Token endpoint: the forced refresh is definitively rejected.
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .respond_with(error_template(400, "invalid_grant"))
+        .mount(&mock)
+        .await;
+    // API: always 401 — but the retry must never happen: re-resolution
+    // fails first.
+    Mock::given(method("GET"))
+        .and(path("/sale/offers"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("revoked"))
+        .mount(&mock)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(dir.path());
+    seed_live_pair(&store, "dead-access", "dead-refresh");
+
+    let auth = AllegroAuth::with_base_url("id".to_owned(), "secret".to_owned(), mock.uri())
+        .with_token_store(store_in(dir.path()));
+
+    let err = dispatch_with_base(
+        &auth,
+        &reqwest::Client::new(),
+        &mock.uri(),
+        &offers_tool(),
+        serde_json::Map::new(),
+    )
+    .await
+    .expect_err("a definitively rejected refresh must fail the dispatch");
+    assert!(
+        err.contains("auth error"),
+        "auth failures surface with the 'auth error' prefix, got: {err}"
+    );
+    assert!(
+        err.contains("re-authorization required"),
+        "the ReauthRequired guidance must be surfaced, got: {err}"
+    );
+    assert!(
+        err.contains("refresh token rejected"),
+        "the reason must say why, got: {err}"
+    );
+    assert!(
+        err.contains("allegro-mcp auth device"),
+        "the guidance must name the CLI command, got: {err}"
+    );
+
+    // The dead pair was wiped — and no second API call was made with the
+    // dead token.
+    assert!(
+        !store.path().exists(),
+        "a definitively rejected refresh must clear the store"
+    );
+    let reqs = mock.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| r.url.path() == "/sale/offers")
+            .count(),
+        1,
+        "no retry with the dead token — re-resolution fails first"
+    );
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| r.url.path() == "/auth/oauth/token")
+            .count(),
+        1,
+        "exactly one refresh attempt"
+    );
+}
+
+/// A *transient* forced-refresh failure (5xx) must neither fail the
+/// dispatch nor wipe the store: the stored access token is the fallback
+/// for the single retry.
+#[tokio::test]
+async fn dispatcher_401_with_transient_refresh_failure_falls_back_to_stored_token() {
+    let mock = MockServer::start().await;
+
+    // Token endpoint: the forced refresh fails transiently — every time
+    // (so only the stored-token fallback can recover).
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("auth server hiccup"))
+        .mount(&mock)
+        .await;
+    // API: 401 exactly once, then 200 (limited mock mounted FIRST).
+    Mock::given(method("GET"))
+        .and(path("/sale/offers"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("stale token"))
+        .up_to_n_times(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/sale/offers"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&mock)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(dir.path());
+    seed_live_pair(&store, "stale-access", "fallback-refresh");
+
+    let auth = AllegroAuth::with_base_url("id".to_owned(), "secret".to_owned(), mock.uri())
+        .with_token_store(store_in(dir.path()));
+
+    let out = dispatch_with_base(
+        &auth,
+        &reqwest::Client::new(),
+        &mock.uri(),
+        &offers_tool(),
+        serde_json::Map::new(),
+    )
+    .await
+    .expect("transient refresh failure must fall back to the stored token");
+    assert_eq!(out, "[]");
+
+    // The store survived the transient failure (pair intact, not wiped).
+    let stored = store_in(dir.path()).load().expect("load store");
+    let saved = stored.tokens.expect("pair kept on a transient failure");
+    assert_eq!(saved.access_token, "stale-access");
+    assert_eq!(saved.refresh_token.as_deref(), Some("fallback-refresh"));
+
+    // The retried request carried the stored access token.
+    let reqs = mock.received_requests().await.expect("recorded requests");
+    let api_reqs: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.url.path() == "/sale/offers")
+        .collect();
+    assert_eq!(api_reqs.len(), 2);
+    let retried_authz = api_reqs[1]
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(
+        retried_authz, "Bearer stale-access",
+        "the fallback must retry with the stored token"
+    );
+}
+
+/// The stale-store guard: after a definitive rejection of *our* refresh
+/// token, a concurrently rotated file is retried with the newer token —
+/// but a *transient* failure of that retry must keep the newer pair on
+/// disk (only a definitive rejection may clear the store).
+#[tokio::test]
+async fn stale_store_guard_transient_retry_failure_keeps_the_newer_pair() {
+    let mock = MockServer::start().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(dir.path());
+    seed_live_pair(&store, "a1", "r1");
+
+    // The mock itself performs the concurrent rotation, so it lands
+    // strictly *between* our store load and the refresh response — exactly
+    // the window the guard exists for: call #1 rejects our token
+    // (`invalid_grant`) and rotates the file to (b1, r2), what a racing
+    // `allegro-mcp auth device` run does; call #2 (the guard's retry with
+    // r2) hits a 5xx.
+    let rotated = Arc::new(AtomicBool::new(false));
+    let rotating_store = store.clone();
+    Mock::given(method("POST"))
+        .and(path("/auth/oauth/token"))
+        .respond_with(move |_req: &wiremock::Request| {
+            if !rotated.swap(true, Ordering::SeqCst) {
+                rotating_store
+                    .save_tokens(
+                        &TokenResponse {
+                            access_token: "b1".to_owned(),
+                            expires_in: 3600,
+                            token_type: Some("bearer".to_owned()),
+                            refresh_token: Some("r2".to_owned()),
+                            scope: Some("allegro:api:read".to_owned()),
+                            jti: None,
+                        },
+                        3600,
+                    )
+                    .expect("concurrent rotation");
+                error_template(400, "invalid_grant")
+            } else {
+                ResponseTemplate::new(500).set_body_string("hiccup")
+            }
+        })
+        .mount(&mock)
+        .await;
+
+    let auth = AllegroAuth::with_base_url("id".to_owned(), "secret".to_owned(), mock.uri())
+        .with_token_store(store_in(dir.path()));
+
+    // Forced re-resolution: r1 is rejected → guard reloads → r2 → 5xx.
+    let err = auth
+        .refresh_now()
+        .await
+        .expect_err("a transient retry failure must propagate");
+    assert!(
+        matches!(err, AuthError::Http(_)),
+        "the transient error must propagate as-is (not be swallowed into a store wipe), got: {err:?}"
+    );
+
+    // The newer pair survives on disk.
+    let stored = store_in(dir.path()).load().expect("store readable");
+    let saved = stored.tokens.expect("the newer pair must be kept");
+    assert_eq!(saved.access_token, "b1");
+    assert_eq!(saved.refresh_token.as_deref(), Some("r2"));
 }

@@ -206,16 +206,22 @@ pub async fn dispatch_with_base(
         .await
         .map_err(|e| format!("HTTP error: {e}"))?;
 
-    // Single 401 retry with token re-resolution. Device tokens are
+    // Single 401 retry with forced token re-resolution. Device tokens are
     // user-scoped and die out-of-band (password change, app unlink, the
     // 20-active-sessions cap — none of which the 60 s pre-expiry refresh
-    // can see), so this hook is the only recovery path short of a full
-    // `allegro-mcp auth device` re-run. Exactly one retry, bounded: if the
-    // retry also fails, its error is returned (the post-refresh body is
-    // more diagnostic than the original 401's).
+    // can see), and a plain re-read would hand back the very token the API
+    // just rejected: an out-of-band revocation never changes the stored
+    // token's expiry, so `refresh_now` skips the stored live token and
+    // exercises the device-mode refresh grant. A definitive refresh
+    // rejection propagates here as "auth error: re-authorization required:
+    // … — run `allegro-mcp auth device`". Exactly one retry, bounded: if
+    // the retry also fails, its error is returned (the post-refresh body
+    // is more diagnostic than the original 401's).
     let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        auth.invalidate().await;
-        let fresh = auth.token().await.map_err(|e| format!("auth error: {e}"))?;
+        let fresh = auth
+            .refresh_now()
+            .await
+            .map_err(|e| format!("auth error: {e}"))?;
         build(&fresh)
             .send()
             .await
